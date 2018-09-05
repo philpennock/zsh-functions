@@ -1,0 +1,782 @@
+# Phil's prompt setup for zsh
+
+zmodload -i zsh/parameter || return 1
+zmodload -i zsh/terminfo 2>/dev/null || typeset -A terminfo
+zmodload -i zsh/net/socket 2>/dev/null || prompt_pdp_missing_zsocket=true
+zmodload -i zsh/datetime 2>/dev/null || return 1  # should not be feasible in a sane build
+autoload is-at-least || return 1
+
+is-at-least 4.3.7 && zmodload -F zsh/stat b:zstat || prompt_pdp_missing_zstat=true
+
+# We used to explicitly load zsh/pcre and have guards against it, then
+# use -pcre-match; but that pre-dates zsh/regex and =~
+# These days we also now have zsh/re2.
+# Some of our patterns require re2 or pcre.
+# We do hard-require that =~ be bound to one of those!
+zmodload -i zsh/re2 2>/dev/null || zmodload -i zsh/pcre 2>/dev/null || prompt_pdp_missing_better_re=true
+[[ -z ${prompt_pdp_missing_better_re:-} ]] && setopt re_match_pcre
+
+function prompt_pdp_help {
+	${PAGER:-cat} <<"EOF"
+This prompt theme provides a left-prompt which expands with more information
+in context-dependent ways, and can be tuned via zstyle to adjust more.  Use
+`prompt pdp +option_on -option_off` to automatically set relevant zstyle conf
+for this shell session at the most granular level and see the immediate effect.
+Note that colour/mono is part of the style name, so switching between mono and
+colour will change the tags shown.
+
+Fields: if a -tag is shown, can be disabled; if +tag, can be enabled
+           = terminal multiplexer information (and terminal emulator controls)
+           = SHLVL depth, if greater than 1
+           = previous command error/signal exit status (unless true)
+ -jobs     : number of jobs in job-table
+ -login    : current login name (contrasting background if root)
+ -host     : current hostname
+   -domain : force-inhibit full domain from hostname
+           = zstyle-controlled employer info (default empty)
+ -tty      : current TTY
+ -time     : current time (when prompt was displayed, not 'now')
+ +kerberos : see remaining Kerberos ticket lifetime
+ +ssh      : see SSH agent key-count, and Local/Remote/Desktop
+ +gpg      : see GnuPG key agent status
+ +awscreds : see age of AWS credentials
+ -histnum  : command history index number
+ -iterm    : use iTerm escape sequences if ITERM_PROFILE set in env
+           = information from 'alt-root' zstyle
+           = current directory information (truncated to trunclen)
+           = directory stack depth (pushd, popd, ...)
+           = A "%" or a "#" prompt marker, then a space character
+
+The employer information comes from the zstyle 'employer-prompt', but requires
+that the zstyle 'employer-domain' be set and match a trailing part of the
+current hostname.  The hostname display normally shows the first two labels
+of the FQDN, unless the FQDN has three labels, then only one is shown.
+
+The 'alt-root' is intended for use where there are parallel directory trees
+which reset various directory hashes to be under the "current" alternative
+root, via chpwd function hooks; it's used with $GOPATH by the author.
+
+Some features require zsh >= 4.3.7 and others require the zsh/re2 or zsh/pcre
+module.  At prompt activation time, missing both re2 and pcre will trigger a
+warning, unless the 'silent-missing-pcre' zstyle is set.
+
+When $TERM is screen*, putty or xterm*, then the terminal title will be set
+either to some Git project information, if inside a Git tree, or basic
+user@host information otherwise.
+
+The special options 'colour'/'color'/'mono' can be used to enable or disable
+a start-up override, coercing colour support on or off; this changes the
+style context for the rest of the prompt setup.
+
+The 'awscreds' feature is designed to work with 99design's aws-vault command
+and requires a dev feature I've written which isn't upstream, so never
+auto-enables.  It requires that AWS_PROFILE be set because I don't currently
+use default credentials.
+EOF
+
+# In addition: our color support pre-dates the nice print sequences for
+# color handling, so is a bit old-fashioned.
+# I try to guard features which require newer zsh, but might miss something and
+# have to do some debugging when running on an ancient box.  But these days,
+# such a box would get my "reduced" .zshrc, with a much simpler prompt
+# configuration.
+}
+
+function prompt_pdp_apply_chpwd {
+	if [[ ${1:-} == reset ]]; then
+		chpwd_functions[(r)chpwd_pdp_prompt]=()
+		return 0
+	elif [[ ${1:-} == wipe ]]; then
+		if (( ${+functions[chpwd_pdp_prompt]} )); then
+			unfunction chpwd_pdp_prompt
+			return 0
+		fi
+		return 1
+	fi
+	if (( ! ${+parameters[chpwd_functions]} )); then
+		chpwd_functions=()
+	fi
+	if (( ! ${chpwd_functions[(I)chpwd_pdp_prompt]} )); then
+		chpwd_functions+=(chpwd_pdp_prompt)
+	fi
+	chpwd_pdp_prompt
+}
+
+function prompt_query_ssh_status {
+	local suffix oIFS ss keycount
+	local -a keylines
+
+	if [[ -z ${SSH_AUTH_SOCK:-} ]]; then print "n/a"; return; fi
+	suffix=R
+	[[ -n ${SSH_AGENT_PID:-} ]] && suffix=L
+	if [[ $OSTYPE == darwin* ]]; then
+		case $SSH_AUTH_SOCK in
+		(/tmp/launch-*) suffix=D ;;
+		(/private/tmp/com.apple.launchd.*/Listeners) suffix=D ;;
+		esac
+	fi
+
+	# When listing keys in OpenSSH 6.4p1, if some blobs can't be decoded,
+	# then output from "ssh-add -l" only goes to stdout if stdout is a tty
+	# (and no I don't understand why).  "ssh-add -L" is more reliable.
+	# It's a little more output, but it's also less work inside ssh-add,
+	# so we use -L here.
+	# Note: -L will include output even for keys of types not recognised
+	# locally; after the stderr will be " comment" to stdout.
+	# So because we want only _usable_ keys, we want to remove from the
+	# count any lines where the first character is a space.
+	oIFS="$IFS"
+	IFS=$'\n'
+	keylines=($(ssh-add -L 2>/dev/null))
+	ss=$?
+	IFS="$oIFS"
+
+	# "The agent has no identities." goes to stdout.
+	# 255 returned when unrecognized parts because remote ssh-agent
+	# supports key-types which we don't support locally.  Not
+	# documented.  It's the result of a fatal() call.  However,
+	# by using -L, we don't invoke the code-path which can call
+	# fatal().
+	if [[ $ss -ne 0 ]]; then
+		keycount=0
+	else
+		keycount="${#keylines:# *}"
+	fi
+	#local keycount="${#${(f):-"$(ssh-add -l)"}}"
+
+	local result="${keycount}${suffix}"
+
+	if [[ -n "${_prompt_pdp_cache_ssh_status:-}" && -n "${_prompt_pdp_cachefile_ssh}" ]]; then
+		if [[ "${_prompt_pdp_cache_ssh_status}" != "${result}" ]]; then
+			# Don't always update the cache file timestamp; otherwise, if there
+			# are N active shells in use, then each one will get triggered to
+			# recheck and reach us, because of the mod timestamp, and then update
+			# the cachefile again once they reload.  So if all actually changed,
+			# there would be N^2 invocations of "ssh-add -L".  Instead, suck it up
+			# and read the contents before maybe-updating, so that the modtime
+			# reflects the _first_ shell to see a switch to the new value.
+			local do_write=0
+			if [[ -f "${_prompt_pdp_cachefile_ssh}" ]]; then
+				local previous
+				read -r previous < "${_prompt_pdp_cachefile_ssh}"
+				if [[ "${previous}" != "${result}" ]]; then
+					do_write=1
+				fi
+			else
+				do_write=1
+			fi
+			if (( do_write )); then
+				printf "%s\n" "${result}" > "${_prompt_pdp_cachefile_ssh}"
+			fi
+		fi
+	fi
+	print "${result}"
+}
+
+# No connections, no forking, so no need to cache
+function prompt_query_gpg_status {
+	if [[ -S ~/.gnupg/S.gpg-agent ]]; then
+		if [[ -n ${prompt_pdp_missing_zsocket:-} ]]; then
+			# can't connect to test; don't report fake errors (ret 1)
+			# if we don't know, but highlight issue
+			print '‽'
+			return 0
+		fi
+		if zsocket ~/.gnupg/S.gpg-agent 2>/dev/null; then
+			exec {REPLY}>&-
+			print '✉︎'
+			# added FE0E "just in case" here too
+			return 0
+		else
+			print '☠︎'  # 0x2620 0xFE0E
+			# 'SKULL AND CROSSBONES' + 'VARIATION SELECTOR-15' (text presentation selector, UTS#51 §1.4.3 ED-8)
+			return 1
+		fi
+	fi
+	if [[ -z "${GPG_AGENT_INFO:-}" ]]; then
+		print '✉'
+		return 1
+	fi
+	local sockpath pid
+	sockpath="${GPG_AGENT_INFO%%:*}"
+	pid="${${GPG_AGENT_INFO#*:}%%:*}"
+	if [[ -S "$sockpath" ]] && kill -0 $pid ; then
+		print '✉'
+		return 0
+	fi
+	print '✗'
+	return 1
+}
+
+function chpwd_pdp_prompt {
+	[[ -t 0 ]] || return
+	local hostlabelcount=2
+	[[ ${#${HOST//[^\.]/}} -eq 2 ]] && hostlabelcount=1
+	if git rev-parse --git-dir >/dev/null 2>&1; then
+		local prj="[$(git config --get project.info.name)]"
+		if [[ "$prj" == "[]" ]]; then
+			prj=${$(git rev-parse --show-toplevel):t}
+		fi
+		local here
+		if [[ $(git rev-parse --is-inside-git-dir) == true ]]; then
+			here="[git-dir]"
+		else
+			here="$(git rev-parse --show-prefix)"
+		fi
+		print -Pn '\e]2;'"git:${prj}:${here}"'\a'
+	else
+		print -Pn '\e]2;%n@%'"${hostlabelcount}"'m:%~\a'
+	fi
+}
+
+function prompt_pdp_precmd {
+	local exitstatus=$?
+	emulate -L zsh	# ksh_arrays breaks us badly
+	psvar=()
+	if (( _prompt_pdp_emit_iterm )); then
+		print -n -- "\e]133;D;${exitstatus}\a"
+		prompt_pdp__emit_iterm_state
+	fi
+	(( _prompt_pdp_krt )) && kerb_remaining_time
+	psvar[1]=$exitstatus
+	if [[ $exitstatus -gt 128 ]];   then psvar[1]=SIG${signals[$exitstatus-127]:-}
+		[[ $psvar[1] == SIG ]] && psvar[1]=$exitstatus
+	elif [[ $exitstatus -eq 127 ]]; then psvar[1]='127/CmdNotFound'		# SUSv4 XCU 2.8.2
+	elif [[ $exitstatus -eq 126 ]]; then psvar[1]='126/CmdNotExecutable'	# SUSv4 XCU 2.8.2
+	elif [[ $exitstatus -eq 125 ]]; then psvar[1]='125/GitBisectUntestable'	# git
+	fi
+	if is-at-least 4.3.7 ; then
+		# We have the 'V' ternary expansion condition available to us
+		psvar[2]=$#jobstates; [[ $psvar[2] -eq 0 ]] && psvar[2]=''
+		psvar[3]=$#dirstack; [[ $psvar[3] -eq 0 ]] && psvar[3]=''
+		if (( _prompt_pdp_krt )); then
+			psvar[4]=$KERB_REMAINING_TIME_ERROR; [[ $psvar[4] -eq 0 ]] && psvar[4]=''
+			psvar[5]="$KERB_REMAINING_TIME_PROMPT"
+		fi
+		if (( _prompt_pdp_ssh )); then
+			if [[ $_prompt_pdp_ssh_redo == yes ]]; then
+				unset _prompt_pdp_ssh_redo
+				_prompt_pdp_cache_ssh_status="$(prompt_query_ssh_status)"
+				_prompt_pdp_cache_ssh_time=${EPOCHSECONDS}
+			fi
+			psvar[6]="$_prompt_pdp_cache_ssh_status"
+			psvar[7]=t
+			[[ $psvar[6] == 0? ]] && psvar[7]=''
+		fi
+		if (( _prompt_pdp_gpg )); then
+			# no need to cache
+			psvar[8]="$(prompt_query_gpg_status)"
+			if [[ $? == 0 ]]; then
+				psvar[9]=t
+			else
+				psvar[9]=''
+			fi
+		fi
+		## RESERVE: 10 thru 12 for prompt_pdp_precmd_awscreds
+		## It has to run after direnv has mutated env, so needs to be in the precmd chain later on
+		## Although I actually achieved this by moving direnv to before prompt setup, so perhaps
+		## I could re-merge it here.
+		if (( _prompt_pdp_awscreds )); then
+			prompt_pdp_precmd_awscreds
+		fi
+	else
+		# We are stuck with 'v'
+		psvar[2]=$#jobstates; [[ $psvar[2] -eq 0 ]] && psvar[2]=''
+		psvar[2]=$#jobstates; [[ $psvar[2] -eq 0 ]] && psvar[2]=()
+	fi
+	return $exitstatus
+}
+
+function prompt_pdp_preexec_kerb {
+	# todo: use not-=~ but something which works when =~ is not advanced?
+	if [[ $1 =~ '(?:(?:^.*/)|\b)(?:kinit|kdestroy)\b' ]]; then
+		kerb_remaining_time wipe-cache
+	fi
+}
+
+function prompt_pdp_precmd_awscreds {
+	local need_lookup
+	if [[ -z "${_pdp_prev_prompt_aws_ts:-}" ]]; then
+		need_lookup=1
+	elif [[ "${AWS_PROFILE:-}" == "$_pdp_prev_prompt_aws_profile" ]] &&
+	   (( (EPOCHSECONDS - _pdp_prev_prompt_aws_ts) < 3600 )); then
+		need_lookup=0
+	else
+		need_lookup=1
+	fi
+	if (( need_lookup )); then
+		_pdp_prompt_pdp_precmd_awscreds_lookup
+		_pdp_prev_prompt_aws_results=("${(@)psvar[10,12]}")
+		_pdp_prev_prompt_aws_profile="${AWS_PROFILE:-}"
+		_pdp_prev_prompt_aws_ts=$EPOCHSECONDS
+	else
+		psvar[10]="${_pdp_prev_prompt_aws_results[1]}"
+		psvar[11]="${_pdp_prev_prompt_aws_results[2]}"
+		psvar[12]="${_pdp_prev_prompt_aws_results[3]}"
+	fi
+}
+
+function _pdp_prompt_pdp_precmd_awscreds_lookup {
+	[[ ${#fg} -eq 0 ]] && local -A fg bg  # complaint suppression copy/paste
+	if [[ -z "$AWS_PROFILE" ]]; then
+		psvar[10]='✗'
+		psvar[11]='none'
+		psvar[12]=''
+		return
+	fi
+	local age
+	if ! age="$(aws-vault info -aV "${AWS_PROFILE}")"; then
+		psvar[10]='💔'
+		psvar[11]=''
+		psvar[12]=''
+		return
+	fi
+	case $age in
+	*\ hours)
+		psvar[10]="${age% hours}H"
+		psvar[11]=''
+		psvar[12]='good'
+		;;
+	*\ minutes)
+		psvar[10]="${age% minutes}M"
+		psvar[11]=''
+		psvar[12]='good'
+		;;
+	*\ days)
+		local d="${age% days}"
+		psvar[10]="${d}D"
+		if (( d < 60 )); then
+			psvar[11]=''
+			psvar[12]='good'
+		else
+			psvar[11]=''
+			psvar[12]=''
+		fi
+		;;
+	*)
+		psvar[10]="$age"
+		psvar[11]=''
+		psvar[12]=''
+		;;
+	esac
+}
+
+function prompt_pdp_preexec_ssh {
+	# todo: use not-=~ but something which works when =~ is not advanced?
+	if [[ $1 =~ '(?:(?:(?:(?:^.*/)|\b)ssh-add\b)|(?:^\s*🔑(?:\s.*)?$))' ]]; then
+		_prompt_pdp_ssh_redo=yes
+	elif (( EPOCHSECONDS - _prompt_pdp_cache_ssh_time > 900 )); then
+		_prompt_pdp_ssh_redo=yes
+	elif [[ -z "${prompt_pdp_missing_zstat:-}" &&
+		-n "${_prompt_pdp_cachefile_ssh}" &&
+		-f "${_prompt_pdp_cachefile_ssh}" ]]; then
+		local st
+		zstat -H st "${_prompt_pdp_cachefile_ssh}" 2>/dev/null || return
+		if (( st[mtime] > _prompt_pdp_cache_ssh_time )); then
+			_prompt_pdp_ssh_redo=yes
+		fi
+	fi
+}
+
+function prompt_pdp_preexec_iterm {
+	(( _prompt_pdp_emit_iterm )) && print -n -- '\e]133;C\a'
+}
+
+# We did just have the bracketing commands, but let's go with the fuller integration
+# suggested by https://iterm2.com/misc/zsh_startup.in
+if (( $+commands[openssl] )); then
+function iterm2_set_user_var {
+	printf '\e]1337;SetUserVar=%s=%s\a' "$1" "$(printf "%s" "$2" | openssl enc -a | tr -d '\n')"
+}
+# if figure out a portable replacement for `openssl enc -a` in a pipeline for
+# where openssl is absent, then handle it.
+fi
+
+function prompt_pdp__emit_iterm_state {
+	print -nP '\e]1337;RemoteHost=%n@%M\a\e]1337;CurrentDir=%~\a'
+	# iTerm would have us let users hook in per-prompt vars here too; deferring implementation
+}
+
+function prompt_pdp_setup__disable_colour {
+	[[ ${(t)fg} == association* ]] || return 0
+	local key
+	for key in ${(k)fg}; do
+		[[ $key == %* ]] || continue
+		resetkeys+=($key)
+	done
+	for key in $resetkeys; do noglob unset fg[$key]; done
+}
+
+function prompt_pdp_setup__colour {
+	readonly CSI=$'\e[' OSC=$'\e]'
+	readonly ul="$CSI$color[underline]m"
+	local key
+	typeset -a resetkeys
+	# Post 4.3.6, colors stopped being available by default (25095)
+	# Lots of stuff has been modernised, but this function needs to
+	# remain compatible with older zsh, so I'm just doing the minimal
+	# changes.  Otherwise, look at new prompt escape sequences %F{...}
+	# and %K{...}.
+	autoload -U colors
+	[[ ${(t)fg} != association* ]] && colors
+
+	for key in ${(k)fg}; do
+		[[ $key == %* ]] || continue
+		resetkeys+=($key)
+	done
+# can't glob the subscripts
+	for key in $resetkeys; do noglob unset fg[$key]; done
+# any %key as referred to in _setup can be used here
+# nb: as well as main area, look at anywhere that prefix is defined
+# we're flooding $fg, as per prompt_bart_setup
+	fg[%n]="$fg[green]"
+	fg[%m]="$fg[yellow]"
+	#fg[%T]="$fg[yellow]"
+	fg[%level]="$ul"
+	#fg[%error]="$bold_color"
+	fg[%error]="$fg_bold[red]"
+	fg[%jobcount]="$bold_color"
+	fg[%path]="$fg[cyan]"
+	fg[%window]="$fg_bold[magenta]"
+	bg[%root]="$bg[red]"
+	fg[%stack]="$fg_bold[green]"
+	fg[%kerbgood]="$fg[green]"
+	fg[%kerbbad]="$fg[red]"
+	fg[%altroot]="$fg[cyan]$bold_color"
+	fg[%sshkeys]=$'\e[38;5;219m'
+	fg[%sshkeys_none]="$fg[red]"
+	fg[%gpgagent_yes]=$'\e[38;5;57m'
+	fg[%gpgagent_none]=$'\e[38;5;124m'
+	fg[%awscreds_good]="$fg[green]"
+	fg[%awscreds_none]="$fg[grey]"
+	fg[%awscreds_old]="$fg[red]"
+	fg[%divider]=$'\e[38;5;238m'
+	return 1
+}
+
+function prompt_pdp_setup {
+	readonly CSI=$'\e[' OSC=$'\e]' ST=$'\a'
+	local -h prefix='' trunclen=40 rs=''
+	local -h employer employer_domain
+	local -h hostlabelcount=2
+	local -h docolour=:
+	local -h onoff onoffint onoffnegated optname
+
+	local style_ctx_base=":prompt:pdp:$TERM:"
+	local style_ctx="$style_ctx_base"
+	local -h coerce_colour
+	local poor_regex=0
+	zstyle -t "${style_ctx_base%:}" colour ; coerce_colour=$?
+	if [[ $coerce_colour == 0 ]]; then
+		style_ctx+=colour
+		docolour=:
+	elif [[ $coerce_colour == 1 ]]; then
+		style_ctx+=mono
+		docolour=false
+	else # exit 2 => not set
+		$docolour && style_ctx+=colour || style_ctx+=mono
+	fi
+
+	if [[ -n ${prompt_pdp_missing_better_re:-} ]] && ! zstyle -t "$style_ctx" silent-missing-pcre ; then
+		print -u2 "prompt:pdp: warning: missing RE2 and PCRE"
+		poor_regex=1
+	fi
+
+	local status_req=0
+	# this one should work with any re; it's the aux functions which require better
+	while [[ $1 =~ ^([+-])(.+)$ ]] ; do
+		optname="$match[2]"
+		if [[ "$match[1]" == "+" ]]; then
+			onoff=on	onoffnegated=off	onoffint=1
+		else
+			onoff=off	onoffnegated=on		onoffint=0
+		fi
+		shift
+		case $optname in
+		(reset)				(( onoffint )) && zstyle -d "$style_ctx" ;;
+		(resetall)			if (( onoffint )); then
+			local s
+			for s in $(zstyle -L ":prompt:pdp*:*" | cut -d ' ' -f 2 | uniq); do
+				zstyle -d "${(Q)s}"
+			done
+		fi ;;
+		(ssh)				zstyle "$style_ctx" show-sshkeys $onoff ;;
+		(gpg|gnupg)			zstyle "$style_ctx" show-gpgagent $onoff ;;
+		(kerb|krb|kerberos|gssapi)	zstyle "$style_ctx" show-kerberos $onoff ;;
+		(awscreds)			zstyle "$style_ctx" show-awscreds $onoff ;;
+		(login|user|username)		zstyle "$style_ctx" show-login $onoff ;;
+		(machine|host|hostname)		zstyle "$style_ctx" show-host $onoff ;;
+		(tty|line)			zstyle "$style_ctx" show-tty $onoff ;;
+		(time)				zstyle "$style_ctx" show-time $onoff ;;
+		(hist|histnum|histno)		zstyle "$style_ctx" show-histnum $onoff ;;
+		(job|jobs)			zstyle "$style_ctx" show-jobs $onoff ;;
+		(domain)			zstyle "$style_ctx" show-domain $onoff ;;
+		(iterm)				zstyle "$style_ctx" emit-iterm $onoff ;;
+		(color|colour)
+			if (( onoffint )); then
+				docolour=:
+				style_ctx="${style_ctx_base}colour"
+				zstyle "${style_ctx_base%:}" colour on
+			else
+				docolour=false
+				style_ctx="${style_ctx_base}mono"
+				prompt_pdp_setup__disable_colour
+				zstyle "${style_ctx_base%:}" colour off
+			fi
+			;;
+		(mono)
+			if (( onoffint )); then
+				docolour=false
+				style_ctx="${style_ctx_base}mono"
+				prompt_pdp_setup__disable_colour
+				zstyle "${style_ctx_base%:}" colour off
+			else
+				docolour=:
+				style_ctx="${style_ctx_base}colour"
+				zstyle "${style_ctx_base%:}" colour on
+			fi
+			;;
+		(status) # special, always just lists
+			status_req=1
+			;;
+		(*) print -u2 "prompt:pdp: unknown option ${(q)optname} to turn $onoff" ;;
+		esac
+	done
+
+# foo.local stet; foo.example.tld => foo; foo.bar.example.tld => foo.bar
+# foo.bar.example.co.cc => foo.bar; BUT foo.example.co.cc => foo.example
+	[[ ${#${HOST//[^\.]/}} -eq 2 ]] && hostlabelcount=1
+
+	if [[ -n $COLORTERM || -n ${terminfo[colors]} ]]; then
+		$docolour && prompt_pdp_setup__colour "$@"
+	fi
+	# $reset_color provided by colors function
+	[[ -n $reset_color ]] && rs="%{$reset_color%}"
+	# And if no colour and under screen, keep from complaining
+	[[ ${#fg} -eq 0 ]] && local -A fg bg
+
+	case ${TERM} in
+	(putty|xterm*)
+		# Why would this be safe?
+		#[[ -z $COLORTERM ]] && export COLORTERM="$TERM"
+		$docolour && prompt_pdp_setup__colour
+		prompt_pdp_apply_chpwd
+		;;
+	(screen|screen[.-]*)
+		prompt_pdp_apply_chpwd
+		# tmux(1) sets TERM to screen.  Also sets $TMUX & $TMUX_PANE
+		# TMUX_PANE is of the form %<num> and % will mess up render if injected
+		# \x5c is backslash '\'; screen(1) §TITLES
+		prefix="%{$fg[%window]%}<${${TMUX_PANE:-$WINDOW}#%}>${fg[%window]:+$rs}%{$(print '\ek\e\x5c')%}"
+		trunclen=33
+		;;
+	(cons*|linux)
+		# This one I'm more sure is safe
+		[[ -z $COLORTERM ]] && export COLORTERM="$TERM"
+		prompt_pdp_apply_chpwd reset
+		$docolour && prompt_pdp_setup__colour
+		;;
+	(*)
+		prompt_pdp_apply_chpwd reset
+		;;
+	esac
+
+	employer=''
+	zstyle -s "$style_ctx" employer-domain employer_domain
+	if [[ -n $employer_domain && $HOST == *.$employer_domain ]]; then
+		zstyle -s "$style_ctx" employer-prompt employer
+	fi
+
+	# _prompt_pdp_krt & _prompt_pdp_ssh & _prompt_pdp_gpg deliberately not local
+	# similarly _prompt_pdp_emit_iterm
+	_prompt_pdp_krt=0
+	_prompt_pdp_ssh=0
+	_prompt_pdp_gpg=0
+	_prompt_pdp_awscreds=0
+	_prompt_pdp_emit_iterm=0
+	zstyle -t "$style_ctx" show-kerberos && _prompt_pdp_krt=1
+	zstyle -t "$style_ctx" show-sshkeys && _prompt_pdp_ssh=1
+	zstyle -t "$style_ctx" show-gpgagent && _prompt_pdp_gpg=1
+	zstyle -t "$style_ctx" show-awscreds && _prompt_pdp_awscreds=1
+	zstyle -T "$style_ctx" emit-iterm && _prompt_pdp_emit_iterm=1
+	# these are only used for selecting sections to show
+	local -h show_login=0 show_tty=0 show_host=0 show_time=0 show_histnum=0 show_jobs=0
+	zstyle -T "$style_ctx" show-login && show_login=1
+	zstyle -T "$style_ctx" show-tty && show_tty=1
+	zstyle -T "$style_ctx" show-host && show_host=1
+	zstyle -T "$style_ctx" show-time && show_time=1
+	zstyle -T "$style_ctx" show-histnum && show_histnum=1
+	zstyle -T "$style_ctx" show-jobs && show_jobs=1
+	zstyle -T "$style_ctx" show-domain || hostlabelcount=1
+
+	[[ -z "${ITERM_PROFILE:-}" ]] && _prompt_pdp_emit_iterm=0
+
+	if zstyle -t "$style_ctx" auto-kerberos; then
+		kerb_remaining_time startup-ping
+		(( ! KERB_REMAINING_TIME_ERROR )) && _prompt_pdp_krt=1
+	fi
+
+	# We can have dir hash entries switch within parallel altroots and then want the altroot in the prompt
+	# Used for parallel GOPATH trees
+	local altroot
+	zstyle -s "$style_ctx" alt-root altroot
+
+	# Need this twice because screen can use it above, hence the first
+	# setting; this is the one which counts, since term-dependent paths
+	# can have set us.
+	[[ -n $reset_color ]] && rs="%{$reset_color%}"
+
+	(( _prompt_pdp_emit_iterm )) && add-zsh-hook preexec prompt_pdp_preexec_iterm
+
+	local identities_section
+	local -a identities
+	if (( _prompt_pdp_krt )) && is-at-least 4.3.7; then
+		if (( poor_regex )); then
+			print -u2 " ... re: so skipping kerberos support"
+			zstyle "$style_ctx" show-kerberos off
+			_prompt_pdp_krt=0
+			add-zsh-hook -d preexec prompt_pdp_preexec_kerb
+		else
+			local kerb
+			kerb="%(4V,%{$fg[%kerbbad]%},%{$fg[%kerbgood]%})%5v$rs"
+			add-zsh-hook preexec prompt_pdp_preexec_kerb
+			kerb_remaining_time startup-ping
+			identities+=("$kerb")
+		fi
+	fi
+	if (( _prompt_pdp_ssh )) && (( poor_regex )); then
+		print -u2 " ... re: so skipping ssh-agent support"
+		zstyle "$style_ctx" show-sshkeys off
+		_prompt_pdp_ssh=0
+		add-zsh-hook -d preexec prompt_pdp_preexec_ssh
+	elif (( _prompt_pdp_ssh )); then
+		local sshstatus
+		add-zsh-hook preexec prompt_pdp_preexec_ssh
+		if is-at-least 4.3.7 ; then
+			sshstatus="%(7V,%{$fg[%sshkeys]%},%{$fg[%sshkeys_none]%})%6v$rs"
+			_prompt_pdp_ssh_redo=yes
+		else
+			local ss ckey='%sshkeys'
+			ss=$(prompt_query_ssh_status)
+			[[ $ss == 0? ]] && ckey='%sshkeys_none'
+			sshstatus="%{$fg[$ckey]%}${ss}$rs"
+			unset ss ckey
+			print -u2 "prompt:pdp: zsh too old, skipping dynamic SSH tracking"
+		fi
+		identities+=("$sshstatus")
+	fi
+	if (( _prompt_pdp_gpg )); then
+		if is-at-least 4.3.7 ; then
+			local gpgstatus
+			gpgstatus="%(9V,%{$fg[%gpgagent_yes]%},%{$fg[%gpgagent_none]%})%8v$rs"
+			identities+=("$gpgstatus")
+		else
+			print -u2 "prompt:pdp: zsh too old, skipping gpg support"
+			zstyle "$style_ctx" show-gpgagent off
+			_prompt_pdp_gpg=0
+		fi
+	fi
+	if (( _prompt_pdp_awscreds )); then
+		if is-at-least 4.3.7 ; then
+			local awscreds
+			#awscreds="%(10V,%{$fg[%awscreds_old]%},%{$fg[%awscreds_good]%})%11v$rs"
+			#awscreds="%{${fg[%10v]}%}%11v$rs"
+			#
+			# If we use `%{%10v%}` with ${fg[%foo]} in 10v then we
+			# discover that escape sequences are vis'd and the
+			# no-movement constraint breaks rendering.
+			#
+			# If we use `%{${fg[%10v]}%}` then we discover that %10v is not supplied
+			# to $fg lookup.  If we use `%10v` with the `%{..%}` in the replacement
+			# then we discover that substitutions are not re-parsed for expandos
+			# (which is probably a good thing security-wise).
+			#
+			# So we use none/old/good as escalating numbers and
+			# dispatch here in something a little more evil.
+			# Put the display string into 10
+			# Use 12 and 11 as bool flags for state, with false/false being bad.
+			awscreds="%(12V,%{$fg[%awscreds_good]%},%(11V,%{$fg[%awscreds_none]%},%{$fg[%awscreds_old]%}))%10v$rs"
+			prompt_pdp_precmd_awscreds
+			add-zsh-hook precmd prompt_pdp_precmd_awscreds
+			identities+=("$awscreds")
+		else
+			print -u2 "prompt:pdp: zsh too old, skipping awscreds support"
+			zstyle "$style_ctx" show-awscreds off
+			_prompt_pdp_awscreds=0
+		fi
+	fi
+	local idsep="%{$fg[%divider]%}⋮$rs"
+	eval identities_section="\${(j,${idsep},)identities}"
+
+	local cp
+	zstyle -s "$style_ctx" cache-path cp
+	if [[ -n "${cp}" ]]; then
+		# deliberately not local vars set here; as many as needed for different features
+		(( _prompt_pdp_ssh )) && _prompt_pdp_cachefile_ssh="$cp/prompt.pdp.ssh"
+	fi
+	unset cp
+
+	local jobflag
+	if is-at-least 4.3.7; then jobflag=V ; else jobflag=v ; fi
+
+	if (( status_req )); then
+		local p l
+		for p in "${(@o)parameters[(I)show_*]}" ; do
+			for l in ${(s:-:)parameters[$p]}; do
+				[[ $l == local ]] || continue
+				print "$p: ${(P)p}"
+				break
+			done
+		done
+		for p in "${(@o)parameters[(I)_prompt_pdp_*]}" ; do
+			print "$p: ${(P)p}"
+		done
+		return 0
+	fi
+
+	local p1
+	local -a pa
+	local empty='%{%}'
+	(( _prompt_pdp_emit_iterm )) && pa+=( "%{${OSC}133;A${ST}%}" )
+	pa+=($prefix)										# terminal multiplexer, most likely
+	pa+=( "%2(L.%{$fg[%level]%}[%L]${fg[%level]:+$rs}.)" )					# SHLVL depth
+	pa+=( "%(?..%{$fg[%error]%}{%v}${fg[%error]:+$rs})" )					# previous command exit status
+	(( show_jobs )) && pa+=( "%(2${jobflag},<%{$fg[%jobcount]%}+%2v${fg[%jobcount]:+$rs}>,-)" )		# extant jobs
+	(( show_login )) && pa+=( "%{$fg[%n]%}%(#.%{$bg[%root]%}.)%n%(#.${bg[%root]:+$rs}.)${fg[%n]:+$rs}" )	# login name
+	(( show_login )) && (( show_host )) &&  pa+=( @ )
+	(( show_host )) && pa+=( "%{$fg[%m]%}%${hostlabelcount}m${fg[%m]:+$rs}" )		# host
+	pa+=( $employer )									# zstyle-controlled employer info
+	if (( show_tty )); then
+		pa+=( : )
+		pa+=( "%{$fg[%line]%}%l${fg[%line]:+$rs}" )					# line (tty)
+	fi
+	(( show_time )) && pa+=( "[%{$fg[%T]%}%T${fg[%T]:+$rs}]" )				# time
+	(( ! show_time )) && [[ -n $identities_section ]] && pa+=( "$idsep" )
+	pa+=( $identities_section )								# kerberos, ssh, etc
+	(( show_histnum )) && pa+=( "(%{$fg[%commandcount]%}%!${fg[%commandcount]:+$rs})" )	# history indexing
+	[[ -n "$altroot" ]] && pa+=( "%{$fg[%altroot]%}{${altroot}}${fg[%altroot]:+$rs}" )	# golang parallel trees
+	pa+=( "%{$fg[%path]%}%${trunclen}<..<%~%<<${fg[%n]:+$rs}" )				# truncated path display
+	is-at-least 4.3.7 && pa+=( "%(3V,%{$fg[%stack]%}(%3v)${fg[%stack]:+$rs},)" )		# directory stack depth
+	pa+=( '%# ' )										# % or #
+	(( _prompt_pdp_emit_iterm )) && pa+=( "%{${OSC}133;B${ST}%}" )
+
+	p1="${(j::)pa}"
+	PS1="${p1//$empty/}"
+	PS2='%(4_:... :)%3_> '
+	PS3='?# '
+	PS4='+%N:%i> '
+	RPS1=""
+	RPS2=""
+	psvar=()
+	function precmd { prompt_pdp_precmd }  # is it purely historical that I'm not using the hooks here?
+	function preexec { }
+	if (( _prompt_pdp_emit_iterm )); then
+		prompt_pdp__emit_iterm_state
+		# if this version number is too low, butterbars appear warning that out-of-date
+		print -nP '\e]1337;ShellIntegrationVersion=5;shell=zsh\a'
+	fi
+}
+
+prompt_pdp_setup "$@"
+
+# vim: set filetype=zsh :

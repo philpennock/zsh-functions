@@ -1,0 +1,184 @@
+#compdef vagrant
+#description tool for building and distributing development environments
+
+# Terminology:
+# Machine: locally defined setup, given a name and tuning parameters,
+#          corresponds to one potentially existing virtual host.
+#          Is local to one Vagrant dir.
+# Box: definition of a bootable image; OS bootable, with VM encapsulation and
+#      possibly some Vagrant metadata.
+#      Exists per-user in ~/.vagrant.d/boxes (or elsewhere if $VAGRANT_HOME set)
+
+# Many setups are single-machine and the machine[s] are never explicitly named
+# by users on the command-line.  That's easy, nothing to do.
+
+# The Vagrant bash completion invokes a lot of external commands, which we avoid.
+# It doesn't handle -VAGRANTSLASH-.
+# I haven't yet fixed the state stuff around subcommands, quite.  My zsh
+# compsys-fu is weak.
+#
+# The boxes use the -VAGRANTSLASH- escaping mechanism, the machines do not (at
+# time of Vagrant 2.0.0).  A slash in a machine name results in nesting as
+# they're unfiltered, and without any indicators we don't know where to recurse
+# and where not.  The directories get created on disk but then Vagrant refuses
+# to bring it up.  For consistency, we apply the same filtering mechanism
+# on the assumption that it will get used one day.
+
+# Reading the bash completion, I see stuff which refers to .vagrant being a
+# file, not a directory.  Not seen that, not handling it.
+
+local curcontext="$curcontext" state state_descr line vdir subcmd
+
+local -a commands box_commands plugin_commands snapshot_commands
+
+commands=( # 'vagrant list-commands' to see _all_ commands
+  'box:manages boxes: installation, removal, etc.'
+  'cap:checks and executes capability'
+  'connect:connect to a remotely shared Vagrant environment'
+  'destroy:stops and deletes all traces of the vagrant machine'
+  'docker-exec:attach to an already-running docker container'
+  'docker-logs:outputs the logs from the Docker container'
+  'docker-run:run a one-off command in the context of a container'
+  'global-status:outputs status Vagrant environments for this user'
+  'halt:stops the vagrant machine'
+  'help:shows the help for a subcommand'
+  'init:initializes a new Vagrant environment by creating a Vagrantfile'
+  'list-commands:outputs all available Vagrant subcommands, even non-primary ones'
+  'login:log in to HashiCorp'"'"'s Vagrant Cloud'
+  'package:packages a running vagrant environment into a box'
+  'plugin:manages plugins: install, uninstall, update, etc.'
+  'port:displays information about guest port mappings'
+  'powershell:connects to machine via powershell remoting'
+  'provider:show provider for this environment'
+  'provision:provisions the vagrant machine'
+  'push:deploys code in this environment to a configured destination'
+  'rdp:connects to machine via RDP'
+  'reload:restarts vagrant machine, loads new Vagrantfile configuration'
+  'resume:resume a suspended vagrant machine'
+  'rsync:syncs rsync synced folders to remote machine'
+  'rsync-auto:syncs rsync synced folders automatically when files change'
+  'share:share your Vagrant environment with anyone in the world'
+  'snapshot:manages snapshots: saving, restoring, etc.'
+  'ssh:connects to machine via SSH'
+  'ssh-config:outputs OpenSSH valid configuration to connect to the machine'
+  'status:outputs status of the vagrant machine'
+  'suspend:suspends the machine'
+  'up:starts and provisions the vagrant environment'
+  'validate:validates the Vagrantfile'
+  'version:prints current and latest Vagrant version'
+  )
+box_commands=( add list outdated prune remove repackage update )
+plugin_commands=( expunge install license list repair uninstall update )
+snapshot_commands=( delete list pop push restore save )
+
+# vagrant cmd works in any sub-dir of a directory which has the .vagrant/ dir
+_vagrant_find_vagrantdir() {
+  local d="$PWD"
+  local d2
+  while [[ "$d" != / ]]; do
+    d2="$d/.vagrant"
+    if [[ -d "$d2" ]]; then
+      printf "%s\n" "$d2"
+      return 0
+    fi
+    d="${d:h}"
+  done
+  return 1
+}
+
+# If a Vagrant file exists, it's Ruby and the only way to get the list of machines
+# from it is to evaluate the Ruby.  However, after just `vagrant status`, with
+# every machine down, .vagrant/machines/ will be populated with an empty
+# directory for each machine name.
+#
+# We take an optional visitor function for filtering the list.
+_vagrant__machines() {
+  local label="$1"
+  local filterfunc="${2:-}"
+  vdir="$(_vagrant_find_vagrantdir)"
+  if [[ $? -ne 0 ]]; then
+    _wanted vagrant-machines expl "$label" compadd -x "no .vagrant dir found, no machines [$label]" --
+    return
+  fi
+  local -a machlist newml
+  machlist=( "$vdir/machines"/*(N/:t) )
+  if [[ -n "$filterfunc" ]]; then
+    newml=()
+    for m in "${machlist[@]}"; do
+      if "$filterfunc" "${m//-VAGRANTSLASH-//}" "$vdir" "$vdir/machines/$m"; then
+        newml+=("$m")
+      fi
+    done
+    machlist=( "${newml[@]}" )
+  fi
+  # As noted at top, applying same logic we use for boxes, even though machines
+  # doesn't currently use it.  Assuming that the escaping will spread as some
+  # clients ask for it.
+  for ((i=1; i <= $#machlist; i++)) {
+    machlist[i]="${machlist[i]//-VAGRANTSLASH-//}"
+  }
+  if [[ $#machlist -eq 0 ]]; then
+    _wanted vagrant-machines expl "$label" compadd -x "no suitable machines found [$label]"
+    return
+  fi
+  _wanted vagrant-machines expl "$label" compadd -a machlist
+}
+
+# Subdirectories of the machine dir are per-VM-system (virtualbox, etc)
+# and the stable identifier for "machine is up", from bash completion, is
+# that the 'id' file exists.
+_vagrant__is_booted() {
+  local machine="$1" vdir="$2" machdir="$3"
+  local d
+  for d in "$machdir"/*(N/); do
+    [[ -f "$d/id" ]] && return 0
+  done
+  return 1
+}
+
+# Commands modifying the state of a machine can take a list of machines (up, provision, suspend, etc)
+_arguments -C : '-h[help]' '-v[version]' ':command:->command' '*::machines:->machines'
+
+case "$state" in
+  (command)
+    _describe -t commands 'Hashicorp vagrant commands' commands
+    return
+    ;;
+esac
+
+subcmd="$words[1]"
+curcontext="${curcontext%:*}=$subcmd:"
+
+case "$subcmd" in
+  (box|plugin|snapshot) state="$subcmd" ;; # this is wrong, doesn't reset, so can: vagrant box add add add add ...
+  (init) state="boxes" ;;
+  (destroy|halt|provision|reload|resume|rsync|ssh|ssh-config|suspend) state="booted-machines" ;; # rdp?
+esac
+
+case "$state" in
+  (machines)
+    _vagrant__machines 'vagrant machines'
+    ;;
+  (booted-machines)
+    _vagrant__machines 'booted vagrant machines' _vagrant__is_booted
+    ;;
+  (box)
+    _wanted vagrant-box-command expl 'vagrant box command' compadd -a box_commands
+    ;;
+  (boxes)
+    local -a boxes
+    boxes=( "${VAGRANT_HOME:-${HOME}/.vagrant.d}/boxes"/*(N/:t) )
+    for ((i=1; i <= $#boxes; i++)) {
+      boxes[i]="${boxes[i]//-VAGRANTSLASH-//}"
+    }
+    _wanted vagrant-boxes expl 'vagrant boxes' compadd -a boxes
+    ;;
+  (plugin)
+    _wanted vagrant-plugin-command expl 'vagrant plugin command' compadd -a plugin_commands
+    ;;
+  (snapshot)
+    _wanted vagrant-snapshot-command expl 'vagrant snapshot command' compadd -a snapshot_commands
+    ;;
+esac
+
+# vim: set ft=zsh sw=2 :

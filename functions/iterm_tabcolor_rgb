@@ -1,0 +1,20 @@
+emulate -LR zsh
+
+# I propagate ITERM_PROFILE over SSH when I can
+if [[ -z "$ITERM_PROFILE" ]]; then return 0; fi
+
+case ${1:-.} in
+(off|disable|reset|clear)
+  printf >/dev/tty '\e]6;1;bg;*;default\a'
+  return
+  ;;
+esac
+
+# The caller can pass 0xHH hex instead of decimal, if they want.
+(( red   = ${1:?need a red 0-255 decimal} ))
+(( green = ${2:?need a green 0-255 decimal} ))
+(( blue  = ${3:?need a blue 0-255 decimal} ))
+
+printf >/dev/tty '\e]6;1;bg;red;brightness;%d\a\e]6;1;bg;green;brightness;%d\a\e]6;1;bg;blue;brightness;%d\a' $red $green $blue
+
+# vim: set ft=zsh :

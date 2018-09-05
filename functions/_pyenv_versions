@@ -1,0 +1,6 @@
+#compdef -value-,PYENV_VERSION,-default-
+
+local expl
+
+_wanted pyenv-versions expl 'Python version through pyenv' \
+  compadd "$@" -- ~/.pyenv/versions/*(-/:t)

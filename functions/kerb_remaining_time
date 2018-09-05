@@ -1,0 +1,177 @@
+#!/bin/echo This is a shell function by necessity
+#
+# This function sets $KERB_REMAINING_TIME, using a cache to keep resolution
+# from happening too often.  The variable contains a string which may contain
+# UTF-8 octets to hold some Unicode code-points.  A couple of subsidiary
+# variables may also be set.
+#
+
+setopt localoptions extended_glob
+
+local CacheName=krt.${${KRB5CCNAME##*/}:-_default}
+
+local style_ctx=":prompt:pdp:$TERM:"
+
+# Update every 5 mins by default
+local lifetime=$((5 * 60))
+# Avoid startup-ping within 30 seconds
+local startup_lifetime=30
+zstyle -t $style_ctx cache-lifetime && \
+  zstyle -s $style_ctx cache-lifetime lifetime
+zstyle -t $style_ctx cache-startup-lifetime && \
+  zstyle -s $style_ctx cache-startup-lifetime startup_lifetime
+local use_cache=0
+zstyle -b $style_ctx use-cache use_cache
+local klist_cmd=''
+zstyle -s $style_ctx klist-command klist_cmd
+[[ -z $klist_cmd ]] && klist_cmd=klist
+
+# _cache_invalid uses ":completion:${curcontext}:"
+# so we can't use that, so no need to set function hooks for it.
+# We just use use-cache & cache-path in the same way.
+local _cache_dir _cache_path _cache_policy
+zstyle -s $style_ctx cache-path _cache_dir
+: ${_cache_dir:=${ZDOTDIR:-$HOME}/.zcompcache}
+_cache_path="$_cache_dir/$CacheName"
+
+if [[ $1 == wipe-cache ]]; then
+	rm -f "$_cache_path"
+	return
+fi
+
+local kerb_startupping_status_failed=0
+if [[ $1 == startup-ping ]]; then
+	local -a srecent
+	srecent=( "$_cache_path"(Nms-$startup_lifetime) )
+	if ! (( $#srecent )); then
+		$klist_cmd -5s >/dev/null 2>&1
+		kerb_startupping_status_failed=$?
+	fi
+fi
+
+if [[ $use_cache == yes && -f "$_cache_path" ]]; then
+	local -a recent
+	recent=( "$_cache_path"(Nms-$lifetime) )
+	if (( $#recent )); then
+		. "$_cache_path"
+		# if startup-ping check confirmed we have a current credential but
+		# we see a failure recorded, then assume that the cache is old and
+		# nuke it.  This probably isn't necessary, when the initial kinit
+		# wrapper is used, which does a wipe-cache, so that the next prompt
+		# display will avoid us, but if in a long-lived terminal kinit is
+		# re-used, we won't have that wrapper.
+		if (( ! kerb_startupping_status_failed )) && \
+		   (( KERB_REMAINING_TIME_ERROR )); then
+			rm -f "$_cache_path"
+		else
+			return 0
+		fi
+	fi
+fi
+
+# Getting the expiry time can be done moderately easily without verbose,
+# but turning that into a delta is a pain.
+
+local krb_expire_in
+
+# nb: MIT is different, this parse-logic (both zsh and perl) only works with Heimdal.
+zmodload -i zsh/datetime >/dev/null 2>&1
+if (( $+builtins[strftime] )); then
+	local -a tgtpara
+	local tgtexp endepoch enddelta
+	tgtpara=(${(f)${(M)${(ps:\n\n:)"$(klist -5v 2>/dev/null)"}##Server: krbtgt*}})
+	if [[ ${#tgtpara} -eq 0 || ${tgtpara[(I)End time:*]} -eq 0 ]]; then
+		krb_expire_in=NoKerb
+	else
+		tgtexp="${${tgtpara[(r)End time:*]}##End time:[[:space:]]##}"
+		if [[ ${tgtexp[(I)expired]} -gt 0 ]]; then
+			krb_expire_in=KerbExpired
+		else
+			strftime -s endepoch -r '%b %e %H:%M:%S %Y' $tgtexp
+			enddelta=$(( endepoch - EPOCHSECONDS ))
+			if (( enddelta <= 0 )); then
+				krb_expire_in=KerbExpired
+			else
+				krb_expire_in=$((enddelta/3600))_$((enddelta%3600/60))
+			fi
+		fi
+	fi
+else
+	# With newer versions of Date::Manip, $TZ being unset in environ leads to Perl
+	# errors spewing to stderr.  If TZ is explicitly the empty string, don't.
+	local have_TZ
+	have_TZ="${TZ+set}"
+	: "${TZ=UTC}"
+	export TZ
+
+	print -u2 "zsh: kerb_remaining_time: falling back to perl parsing"
+	krb_expire_in=$( $klist_cmd -5v 2>/dev/null | perl -MDate::Manip -l -00 -ne '
+		next unless m,^Server: krbtgt/,;
+		($end) = /^End time:\s+(.+)$/m;
+		unless ($end) { print "NoKerb"; exit 0 };
+		if ($end =~ /expired/) { print "KerbExpired"; exit 0 };
+		print Delta_Format( DateCalc(ParseDate("now"), ParseDate($end)), 0, "%hv_%mv");
+		')
+	[[ -z $krb_expire_in ]] && krb_expire_in=NoKerb
+
+	if [[ -z $have_TZ ]]; then
+		unset TZ
+	fi
+fi
+
+case ${(U)krb_expire_in} in
+(NOKERB)
+	KERB_REMAINING_TIME=0
+	KERB_REMAINING_TIME_PROMPT=NoK
+	KERB_REMAINING_TIME_ERROR=1
+	;;
+(KERBEXPIRED)
+	KERB_REMAINING_TIME=0
+	KERB_REMAINING_TIME_PROMPT='K☠'
+	KERB_REMAINING_TIME_ERROR=1
+	;;
+(*)
+	integer hours
+	integer mins
+	integer i
+	local vulgar
+	local -A krt_time_maps
+	hours=${krb_expire_in%%_*}
+	mins=${krb_expire_in##*_}
+	KERB_REMAINING_TIME=$krb_expire_in
+	KERB_REMAINING_TIME_PROMPT=''
+	KERB_REMAINING_TIME_ERROR=0
+	# round down for anything larger than delta, as we're after approximations
+	# thus 1/4 ¼ is 15 mins, we count >= 14 mins
+	krt_time_maps=( 0 ''  1 δ  7 ⅛  14 ¼  19 ⅓  22 ⅜  28 ½  36 ⅝  39 ⅔  52 ⅞ )
+	if (( hours == 0 )); then
+		KERB_REMAINING_TIME_PROMPT="${mins}M"
+		(( mins <= 30 )) && KERB_REMAINING_TIME_ERROR=1
+	elif (( mins >= 58 )); then
+		hours+=1
+		KERB_REMAINING_TIME_PROMPT="${hours}≈"
+	else
+		for i in ${(knO)krt_time_maps}; do
+			if (( mins >= i )); then
+				KERB_REMAINING_TIME_PROMPT="${hours}${krt_time_maps[$i]}"
+				break
+			fi
+		done
+	fi
+	;;
+esac
+
+if [[ $use_cache == yes ]]; then
+	local _parent=${_cache_path:h}
+	zf_mkdir -m 0700 -p $_parent
+	local var
+	for var in \
+		KERB_REMAINING_TIME \
+		KERB_REMAINING_TIME_PROMPT \
+		KERB_REMAINING_TIME_ERROR
+	do
+		print -r "$var=${(Pqq)^^var}"
+	done >! "$_cache_path"
+fi
+
+# vim: set ft=zsh :

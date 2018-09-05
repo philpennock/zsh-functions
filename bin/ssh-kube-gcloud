@@ -1,0 +1,4 @@
+#!/bin/sh -eu
+# The Kubernetes part is all in the completion function _ssh-kube-gcloud
+: "${GCLOUD_SSH_KEYFILE:=~/.ssh/id_ed25519}"
+exec gcloud compute ssh --ssh-key-file "${GCLOUD_SSH_KEYFILE:?}" "$@"

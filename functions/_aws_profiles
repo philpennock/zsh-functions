@@ -1,0 +1,22 @@
+#compdef -value-,AWS_PROFILE,-default- aws-auth-2fa
+
+local expl
+
+local -a aws_from_config aws_from_credentials
+local fn full target pre post
+
+for fn target pre post in \
+	config      aws_from_config      '[profile '  ']'  \
+	credentials aws_from_credentials '['          ']'  \
+; do
+	full="${AWS_CONFIG_FILE:-$HOME/.aws/$fn}"
+	[[ -r "$full" ]] || continue
+	set -A "$target" ${${${(Mo)${(f)"$(<"$full")"}##${pre}*${post}}#${pre}}%${post}}
+done
+
+# aws-vault list --profiles ; aws-vault list --credentials
+# but the former includes settings which aren't profiles, while the latter is
+# too short, and there's no way to get a combined list without doing both
+
+_wanted aws-profiles expl 'AWS profile name' \
+  compadd "$@" -a aws_from_config aws_from_credentials
