@@ -824,6 +824,12 @@ function prompt_pdp_setup {
 		# if this version number is too low, butterbars appear warning that out-of-date
 		print -nP '\e]1337;ShellIntegrationVersion=5;shell=zsh\a'
 	fi
+
+	if is-at-least 5.4; then
+		# This is supposed to be for when prompts are replaced, but AFAICT from code inspection is currently only used when previewing?
+		# Should check more before opening my mouth on ML.
+		prompt_cleanup '(){ local x; for x in preexec chpwd precmd; do add-zsh-hook -D "$x" "prompt_pdp_*"; done }'
+	fi
 }
 
 prompt_pdp_setup "$@"
