@@ -56,6 +56,15 @@ zstyle ':prompt:pdp*:*' show-sshkeys on
 zstyle ':prompt:pdp*:*' show-gpgagent on
 ```
 
+There is now support for displaying the current `pyenv version-name` in the
+right-hand-side prompt `RPS1`; it also supports being auto-enabled via setting
+an environment variable, to integrate with [`direnv(1)`](https://direnv.net/).
+To use it, wherever you `export PYENV_VERSION=...` also
+`export _prompt_pdp_pyenv='!'` as a trigger.  The prompt functions will spot
+that the internal variable is exported and unexport it, before turning on its
+own pyenv mode.  This support doesn't handle arbitrary "something assigned to
+`PYENV_VERSION`, unfortunately.  We'd need watches on variables for that.
+
 ## Functions
 
 Set up autoload for these and most of them will help with tab-completion.

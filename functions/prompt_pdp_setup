@@ -40,6 +40,7 @@ Fields: if a -tag is shown, can be disabled; if +tag, can be enabled
  +ssh      : see SSH agent key-count, and Local/Remote/Desktop
  +gpg      : see GnuPG key agent status
  +awscreds : see age of AWS credentials
+ +pyenv    : see pyenv version in RPS1
  -histnum  : command history index number
  -iterm    : use iTerm escape sequences if ITERM_PROFILE set in env
            = information from 'alt-root' zstyle
@@ -342,6 +343,11 @@ function _pdp_prompt_pdp_precmd_awscreds_lookup {
 		psvar[11]=''
 		psvar[12]='good'
 		;;
+	*\ seconds)
+		psvar[10]="${age% seconds}S"
+		psvar[11]=''
+		psvar[12]='good'
+		;;
 	*\ days)
 		local d="${age% days}"
 		psvar[10]="${d}D"
@@ -380,6 +386,22 @@ function prompt_pdp_preexec_ssh {
 
 function prompt_pdp_preexec_iterm {
 	(( _prompt_pdp_emit_iterm )) && print -n -- '\e]133;C\a'
+}
+
+# Note that PYENV_VERSION changed by direnv so _after_ the cd, thus the chdir
+# just needs to signal that an update is needed.
+function prompt_pdp_hook_update_pyenv { _prompt_pdp_pyenv='!' }
+# Unusually, we always register the precmd, and then say "if unset then skip".
+# This is so that I can use direnv to export it and trigger auto-enable.
+function prompt_pdp_precmd_pyenv {
+	[[ -n "$_prompt_pdp_pyenv" ]] || return 0
+	if [[ ${(t)_prompt_pdp_pyenv} == *'export'* ]]; then
+		unset _prompt_pdp_pyenv
+		prompt pdp +pyenv
+		_prompt_pdp_pyenv='!'
+	fi
+	[[ "$_prompt_pdp_pyenv" != '!' ]] || _prompt_pdp_pyenv="$(pyenv version-name)"
+	psvar[13]="$_prompt_pdp_pyenv"
 }
 
 # We did just have the bracketing commands, but let's go with the fuller integration
@@ -450,6 +472,7 @@ function prompt_pdp_setup__colour {
 	fg[%awscreds_good]="$fg[green]"
 	fg[%awscreds_none]="$fg[grey]"
 	fg[%awscreds_old]="$fg[red]"
+	fg[%pyenv]=$'\e[38;2;75;139;190m'  # #4B8BBE <https://www.schemecolor.com/python-logo-colors.php>
 	fg[%divider]=$'\e[38;5;238m'
 	return 1
 }
@@ -461,6 +484,7 @@ function prompt_pdp_setup {
 	local -h hostlabelcount=2
 	local -h docolour=:
 	local -h onoff onoffint onoffnegated optname
+	local -a rhs_sections
 
 	local style_ctx_base=":prompt:pdp:$TERM:"
 	local style_ctx="$style_ctx_base"
@@ -483,6 +507,7 @@ function prompt_pdp_setup {
 	fi
 
 	local status_req=0
+	rhs_sections=()
 	# this one should work with any re; it's the aux functions which require better
 	while [[ $1 =~ ^([+-])(.+)$ ]] ; do
 		optname="$match[2]"
@@ -504,6 +529,7 @@ function prompt_pdp_setup {
 		(gpg|gnupg)			zstyle "$style_ctx" show-gpgagent $onoff ;;
 		(kerb|krb|kerberos|gssapi)	zstyle "$style_ctx" show-kerberos $onoff ;;
 		(awscreds)			zstyle "$style_ctx" show-awscreds $onoff ;;
+		(pyenv)				zstyle "$style_ctx" show-pyenv $onoff ;;
 		(login|user|username)		zstyle "$style_ctx" show-login $onoff ;;
 		(machine|host|hostname)		zstyle "$style_ctx" show-host $onoff ;;
 		(tty|line)			zstyle "$style_ctx" show-tty $onoff ;;
@@ -593,11 +619,13 @@ function prompt_pdp_setup {
 	_prompt_pdp_ssh=0
 	_prompt_pdp_gpg=0
 	_prompt_pdp_awscreds=0
+	_prompt_pdp_pyenv=0
 	_prompt_pdp_emit_iterm=0
 	zstyle -t "$style_ctx" show-kerberos && _prompt_pdp_krt=1
 	zstyle -t "$style_ctx" show-sshkeys && _prompt_pdp_ssh=1
 	zstyle -t "$style_ctx" show-gpgagent && _prompt_pdp_gpg=1
 	zstyle -t "$style_ctx" show-awscreds && _prompt_pdp_awscreds=1
+	zstyle -t "$style_ctx" show-pyenv && _prompt_pdp_pyenv=1
 	zstyle -T "$style_ctx" emit-iterm && _prompt_pdp_emit_iterm=1
 	# these are only used for selecting sections to show
 	local -h show_login=0 show_tty=0 show_host=0 show_time=0 show_histnum=0 show_jobs=0
@@ -705,6 +733,20 @@ function prompt_pdp_setup {
 			_prompt_pdp_awscreds=0
 		fi
 	fi
+	# We always register the precmd hook, so that it can auto-enable pyenv
+	# display via export, for direnv integration.
+	add-zsh-hook precmd prompt_pdp_precmd_pyenv
+	if (( _prompt_pdp_pyenv )); then
+		# reserve 13v
+		rhs_sections+=( "%{$fg[%pyenv]%}%13v$rs" )
+		add-zsh-hook chpwd prompt_pdp_hook_update_pyenv
+		#
+		prompt_pdp_hook_update_pyenv
+		prompt_pdp_precmd_pyenv
+		# really want a way to watch any shell variable and call a hook when it's updated, so that we can also trigger on calls which change PYENV_VERSION
+	fi
+	# nb: if bumping psvar version count, change end of range in +status info dump
+
 	local idsep="%{$fg[%divider]%}⋮$rs"
 	eval identities_section="\${(j,${idsep},)identities}"
 
@@ -730,6 +772,9 @@ function prompt_pdp_setup {
 		done
 		for p in "${(@o)parameters[(I)_prompt_pdp_*]}" ; do
 			print "$p: ${(P)p}"
+		done
+		for p in {1..13}; do
+			print "$p: ${(V)psvar[p]}"
 		done
 		return 0
 	fi
@@ -765,7 +810,11 @@ function prompt_pdp_setup {
 	PS2='%(4_:... :)%3_> '
 	PS3='?# '
 	PS4='+%N:%i> '
-	RPS1=""
+	if (( ${#rhs_sections} )); then
+		eval RPS1="\${(j,${idsep},)rhs_sections}"
+	else
+		RPS1=''
+	fi
 	RPS2=""
 	psvar=()
 	function precmd { prompt_pdp_precmd }  # is it purely historical that I'm not using the hooks here?
