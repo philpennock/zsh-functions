@@ -33,13 +33,15 @@ In `~/.zshrc` or equivalent:
 autoload promptinit
 promptinit
 prompt pdp
+
+setopt transient_rprompt
 ```
 
 I actually have setup to maintain a per-host cache in an OS-specific cache
 location, so that `~/Library/Caches/zsh/osmium` is correct for my current
 laptop; this then feeds into uncommenting the `use-cache` above.
 
-My laptop has:
+My macOS laptop had:
 
 ```sh
 zstyle ':prompt:pdp*:*' employer-domain pennock-tech.net
@@ -47,6 +49,14 @@ zstyle ':prompt:pdp*:*' employer-prompt $'@%{\e[38;2;0;180;222m%}PennockTech%{\e
 zstyle ':prompt:pdp*:*' show-domain off
 zstyle ':prompt:pdp*:*' auto-kerberos on
 zstyle ':prompt:pdp*:*' show-awscreds on
+```
+
+My Linux laptop, unable to use the aws-vault info sub-command to get rotation
+times, skips `show-awscreds` but does have:
+
+```sh
+zstyle ':prompt:pdp*:*' show-awsprofile on
+zstyle ':prompt:pdp*:*' show-pyenv on
 ```
 
 Another box just has:
@@ -65,17 +75,38 @@ that the internal variable is exported and unexport it, before turning on its
 own pyenv mode.  This support doesn't handle arbitrary "something assigned to
 `PYENV_VERSION`, unfortunately.  We'd need watches on variables for that.
 
+I now display by default a rendering of `$KUBE_CONTEXT` and `$KUBE_NAMESPACE`
+in my RHS prompt, used by my wrappers around `kubectl` and `helm` so that I
+can change into a directory with a `.envrc` containing something like
+`export KUBE_NAMESPACE=top-www` and be automatically pointed to the right bit
+of a Kubernetes cluster for a given app.
+
+When setting authentication credentials or the like into variables, it's handy
+to be able to tell apart the tabs and know which variables are available to
+me.  Arbitrary content can be assigned to `PDP_LABEL` (non-exported) just to
+get a convenient red tag.
+
+With this expansion in the use of `$RPS1`, setting the zsh `transient_rprompt`
+option makes it much easier to copy/paste commands without the RHS prompt
+getting in the way.
+
 ## Functions
 
 Set up autoload for these and most of them will help with tab-completion.
 
+* `_aws` — wrapper around bash completion, this one actually works
 * `_aws_profiles` — let `AWS_PROFILE=` tab-complete usefully
+* `_aws-vault` — completion for `aws-vault`
 * `_pyenv_versions` — let `PYENV_VERSION=` tab-complete usefully
 * `_ssh-kube-gcloud` — completion for `bin/ssh-kube-gcloud` which is a wrapper
   around `gcloud compute ssh`; gcloud's tab-completion hits a remote end-point
   every time you press tab, so is hideously slow.  This completion caches,
   making it occasionally slow but usually fast.
 * `_vagrant` — decent fast tab-completion for Vagrant
+* `_kube_contexts` & `_kube_namespaces` — completion for
+  `$KUBE_CONTEXT` & `$KUBE_NAMESPACE`
+* `_nodenv_versions`, `_pyenv_versions`, `_rbenv_versions` — completion for
+  shell variables for controlling the respective interpreter dispatchers.
 * `prompt_pdp_setup` — invoked by zsh's prompt framework when told to use the
   `pdp` prompt
 * `kerb_remaining_time` — cached invocation of `klist(1)` to determine
@@ -83,3 +114,6 @@ Set up autoload for these and most of them will help with tab-completion.
 * `iterm_tabcolor_rgb` — setting tab colors for iTerm without another
   fork/exec
 
+I also use some items in `zfuncs.zsh` which are not auto-loaded but are
+directly in-line, typically to avoid defining them unless some command is
+installed.
