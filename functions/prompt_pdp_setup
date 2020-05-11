@@ -37,10 +37,13 @@ Fields: if a -tag is shown, can be disabled; if +tag, can be enabled
  -tty      : current TTY
  -time     : current time (when prompt was displayed, not 'now')
  +kerberos : see remaining Kerberos ticket lifetime
- +ssh      : see SSH agent key-count, and Local/Remote/Desktop
+ +ssh      : see SSH agent key-count, and Local/Remote/Desktop/Phil
  +gpg      : see GnuPG key agent status
  +awscreds : see age of AWS credentials
+ +awsprofile : see AWS_PROFILE in RPS1
  +pyenv    : see pyenv version in RPS1
+ -kube     : see any kube overrides in RPS1
+ -label    : see PDP_LABEL in RPS1, for tagging windows
  -histnum  : command history index number
  -iterm    : use iTerm escape sequences if ITERM_PROFILE set in env
            = information from 'alt-root' zstyle
@@ -73,6 +76,15 @@ The 'awscreds' feature is designed to work with 99design's aws-vault command
 and requires a dev feature I've written which isn't upstream, so never
 auto-enables.  It requires that AWS_PROFILE be set because I don't currently
 use default credentials.
+
+The 'kube' feature assumes $KUBE_CONTEXT and $KUBE_NAMESPACE are inserted by
+some kind of shim into invocations of various kubernetes commands.
+
+The 'label' feature uses $PDP_LABEL (& optional $PDP_LABEL_COLOR) to shove
+some arbitrary text into RPS1; this is used when I've set auth credentials
+in some window and I want to be able to see which one.
+NB: because of limitations in current setup, either `setopt prompt_subst` or
+re-invoke `prompt pdp` aftet setting PDP_LABEL_COLOR.
 EOF
 
 # In addition: our color support pre-dates the nice print sequences for
@@ -82,6 +94,10 @@ EOF
 # such a box would get my "reduced" .zshrc, with a much simpler prompt
 # configuration.
 }
+
+# keyed by ssh role, else 'default'
+typeset -gA _prompt_pdp_cache_ssh_status _prompt_pdp_cachefile_ssh _prompt_pdp_cache_ssh_time
+typeset -g _prompt_pdp_cache_latest_role _prompt_pdp_cache_dir
 
 function prompt_pdp_apply_chpwd {
 	if [[ ${1:-} == reset ]]; then
@@ -106,8 +122,24 @@ function prompt_pdp_apply_chpwd {
 function prompt_query_ssh_status {
 	local suffix oIFS ss keycount
 	local -a keylines
+	local -i never_write=0
+	local rolename ckey role_prompt
 
-	if [[ -z ${SSH_AUTH_SOCK:-} ]]; then print "n/a"; return; fi
+	rolename="${SSH_PDP_ROLE:-}"
+	ckey="${rolename:-default}"
+	case "${(t)SSH_PDP_ROLE:-unset}" in
+	'unset') role_prompt='' ;;
+	*'export'*)
+		role_prompt="<$rolename>"
+		local -x SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/pdp.ssh/agent-${SSH_PDP_ROLE}.systemd"
+		;;
+	*)
+		role_prompt="<⸘$rolename‽>"
+		local -x SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/pdp.ssh/agent-${SSH_PDP_ROLE}.systemd"
+		;;
+	esac
+
+	if [[ -z ${SSH_AUTH_SOCK:-} || ! -S "${SSH_AUTH_SOCK:-}" ]]; then print "n/a${role_prompt}"; return; fi
 	suffix=R
 	[[ -n ${SSH_AGENT_PID:-} ]] && suffix=L
 	if [[ $OSTYPE == darwin* ]]; then
@@ -116,6 +148,10 @@ function prompt_query_ssh_status {
 		(/private/tmp/com.apple.launchd.*/Listeners) suffix=D ;;
 		esac
 	fi
+	if [[ $suffix == R ]]; then case $SSH_AUTH_SOCK in
+		(*/pdp.ssh/agent.systemd*) suffix=S ;;
+		(*/pdp.ssh/agent*) suffix=P ;;
+	esac; fi
 
 	# When listing keys in OpenSSH 6.4p1, if some blobs can't be decoded,
 	# then output from "ssh-add -l" only goes to stdout if stdout is a tty
@@ -126,9 +162,18 @@ function prompt_query_ssh_status {
 	# locally; after the stderr will be " comment" to stdout.
 	# So because we want only _usable_ keys, we want to remove from the
 	# count any lines where the first character is a space.
+	#
+	# BEWARE HANG: if ssh-add has invoked ssh-askpass and a dialogue window
+	# is hanging around somewhere, waiting, then the agent will not handle
+	# other requests, including this one, which will mean that we can hang
+	# on returning to a shell prompt.
 	oIFS="$IFS"
 	IFS=$'\n'
-	keylines=($(ssh-add -L 2>/dev/null))
+	if (( $+commands[timeout] )); then
+		keylines=($(timeout 2s ssh-add -L 2>/dev/null))
+	else
+		keylines=($(ssh-add -L 2>/dev/null))
+	fi
 	ss=$?
 	IFS="$oIFS"
 
@@ -140,35 +185,40 @@ function prompt_query_ssh_status {
 	# fatal().
 	if [[ $ss -ne 0 ]]; then
 		keycount=0
+		if [[ $ss -eq 124 ]]; then
+			never_write=1
+			suffix="${suffix}⏰"
+		fi
 	else
 		keycount="${#keylines:# *}"
 	fi
 	#local keycount="${#${(f):-"$(ssh-add -l)"}}"
 
-	local result="${keycount}${suffix}"
+	local result="${keycount}${suffix}${role_prompt}"
 
-	if [[ -n "${_prompt_pdp_cache_ssh_status:-}" && -n "${_prompt_pdp_cachefile_ssh}" ]]; then
-		if [[ "${_prompt_pdp_cache_ssh_status}" != "${result}" ]]; then
-			# Don't always update the cache file timestamp; otherwise, if there
-			# are N active shells in use, then each one will get triggered to
-			# recheck and reach us, because of the mod timestamp, and then update
-			# the cachefile again once they reload.  So if all actually changed,
-			# there would be N^2 invocations of "ssh-add -L".  Instead, suck it up
-			# and read the contents before maybe-updating, so that the modtime
-			# reflects the _first_ shell to see a switch to the new value.
-			local do_write=0
-			if [[ -f "${_prompt_pdp_cachefile_ssh}" ]]; then
-				local previous
-				read -r previous < "${_prompt_pdp_cachefile_ssh}"
-				if [[ "${previous}" != "${result}" ]]; then
-					do_write=1
-				fi
-			else
+	if [[ -n "${_prompt_pdp_cache_ssh_status[$ckey]:-}" && -n "${_prompt_pdp_cachefile_ssh[$ckey]}" ]] &&
+	   [[ "${_prompt_pdp_cache_ssh_status[$ckey]}" != "${result}" ]] &&
+	   (( ! never_write ))
+	then
+		# Don't always update the cache file timestamp; otherwise, if there
+		# are N active shells in use, then each one will get triggered to
+		# recheck and reach us, because of the mod timestamp, and then update
+		# the cachefile again once they reload.  So if all actually changed,
+		# there would be N^2 invocations of "ssh-add -L".  Instead, suck it up
+		# and read the contents before maybe-updating, so that the modtime
+		# reflects the _first_ shell to see a switch to the new value.
+		local do_write=0
+		if [[ -f "${_prompt_pdp_cachefile_ssh[$ckey]}" ]]; then
+			local previous
+			read -r previous < "${_prompt_pdp_cachefile_ssh[$ckey]}"
+			if [[ "${previous}" != "${result}" ]]; then
 				do_write=1
 			fi
-			if (( do_write )); then
-				printf "%s\n" "${result}" > "${_prompt_pdp_cachefile_ssh}"
-			fi
+		else
+			do_write=1
+		fi
+		if (( do_write )); then
+			printf "%s\n" "${result}" > "${_prompt_pdp_cachefile_ssh[$ckey]}"
 		fi
 	fi
 	print "${result}"
@@ -215,14 +265,21 @@ function chpwd_pdp_prompt {
 	[[ ${#${HOST//[^\.]/}} -eq 2 ]] && hostlabelcount=1
 	if git rev-parse --git-dir >/dev/null 2>&1; then
 		local prj="[$(git config --get project.info.name)]"
-		if [[ "$prj" == "[]" ]]; then
-			prj=${$(git rev-parse --show-toplevel):t}
-		fi
 		local here
 		if [[ $(git rev-parse --is-inside-git-dir) == true ]]; then
 			here="[git-dir]"
+			if [[ "$prj" == "[]" ]]; then
+				local agd
+				agd="$(git rev-parse --absolute-git-dir)"
+				if [[ "${agd:t}" == .git ]]; then
+					prj="${agd:h:t}"
+				else
+					prj="${agd:t}"
+				fi
+			fi
 		else
 			here="$(git rev-parse --show-prefix)"
+			[[ "$prj" != "[]" ]] || prj=${$(git rev-parse --show-toplevel):t}
 		fi
 		print -Pn '\e]2;'"git:${prj}:${here}"'\a'
 	else
@@ -230,7 +287,13 @@ function chpwd_pdp_prompt {
 	fi
 }
 
-function prompt_pdp_precmd {
+# I used to call this prompt_pdp_precmd but after introducing some other
+# functions prompt_pdp_precmd_foo, I found that on sufficiently old Zsh (5.0.2)
+# the add-zsh-hook machinery would false positive match on the hook for this
+# function, as a prefix, already being present.  So renamed to end _main to
+# avoid debugging more deeply (especially since I can't update all the boxes
+# this would need patching on, even if it's not a C-level Zsh bug).
+function prompt_pdp_precmd_main {
 	local exitstatus=$?
 	emulate -L zsh	# ksh_arrays breaks us badly
 	psvar=()
@@ -245,6 +308,8 @@ function prompt_pdp_precmd {
 	elif [[ $exitstatus -eq 127 ]]; then psvar[1]='127/CmdNotFound'		# SUSv4 XCU 2.8.2
 	elif [[ $exitstatus -eq 126 ]]; then psvar[1]='126/CmdNotExecutable'	# SUSv4 XCU 2.8.2
 	elif [[ $exitstatus -eq 125 ]]; then psvar[1]='125/GitBisectUntestable'	# git
+	elif [[ $exitstatus -eq 124 ]]; then psvar[1]='124/Timeout'		# timeout(1), GNU coreutils & FreeBSD
+	# If adding other cases here, update reduced/.zshrc too
 	fi
 	if is-at-least 4.3.7 ; then
 		# We have the 'V' ternary expansion condition available to us
@@ -255,12 +320,18 @@ function prompt_pdp_precmd {
 			psvar[5]="$KERB_REMAINING_TIME_PROMPT"
 		fi
 		if (( _prompt_pdp_ssh )); then
+			# _prompt_pdp_ssh_redo normally set by a pre-exec hook, buy can also be set when this env var changes
+			if [[ $_prompt_pdp_cache_latest_role != ${SSH_PDP_ROLE:-default} ]]; then
+				_prompt_pdp_ssh_redo=yes
+				_prompt_pdp_cache_latest_role="${SSH_PDP_ROLE:-default}"
+				_prompt_pdp_cachefile_ssh[${SSH_PDP_ROLE:-default}]="${_prompt_pdp_cache_dir:?}/prompt.pdp.ssh${SSH_PDP_ROLE+.}${SSH_PDP_ROLE:-}"
+			fi
 			if [[ $_prompt_pdp_ssh_redo == yes ]]; then
 				unset _prompt_pdp_ssh_redo
-				_prompt_pdp_cache_ssh_status="$(prompt_query_ssh_status)"
-				_prompt_pdp_cache_ssh_time=${EPOCHSECONDS}
+				_prompt_pdp_cache_ssh_status[${SSH_PDP_ROLE:-default}]="$(prompt_query_ssh_status)"
+				_prompt_pdp_cache_ssh_time[${SSH_PDP_ROLE:-default}]=${EPOCHSECONDS}
 			fi
-			psvar[6]="$_prompt_pdp_cache_ssh_status"
+			psvar[6]="$_prompt_pdp_cache_ssh_status[${SSH_PDP_ROLE:-default}]"
 			psvar[7]=t
 			[[ $psvar[6] == 0? ]] && psvar[7]=''
 		fi
@@ -280,6 +351,49 @@ function prompt_pdp_precmd {
 		if (( _prompt_pdp_awscreds )); then
 			prompt_pdp_precmd_awscreds
 		fi
+		# 13: used for pyenv version
+		case "${(t)AWS_PROFILE:-unset}" in
+		'unset') psvar[14]='' ;;
+		*'export'*) psvar[14]="${AWS_PROFILE:-}" ;;
+		*) psvar[14]="[UNEXPORTED:$AWS_PROFILE]" ;;
+		esac
+		# KUBE_CONTEXT and KUBE_NAMESPACE are shell overrides, used for
+		# a kubectl wrapper and don't need to be exported, but let's
+		# impose that anyway so that external commands can use them.
+		# envrc/direnv will have exported them when set anyway.
+		local kp k1 k2
+		kp='⎈ ' # 0x2388 HELM SYMBOL (and a space)
+		case "${(t)KUBE_CONTEXT:-unset}" in
+		'unset') k1='' ;;
+		*'export'*) k1="${KUBE_CONTEXT:-}" ;;
+		*) k1="[UNEXPORTED:$KUBE_CONTEXT]" ;;
+		esac
+		case "${(t)KUBE_NAMESPACE:-unset}" in
+		'unset') k2='' ;;
+		*'export'*) k2="${KUBE_NAMESPACE:-}" ;;
+		*) k2="[UNEXPORTED:$KUBE_NAMESPACE]" ;;
+		esac
+		if [[ -z "$k1" && -z "$k2" ]]; then
+			psvar[15]=''
+		elif [[ -n "$k1" && -n "$k2" ]]; then
+			psvar[15]="${kp}{$k1}$k2"
+		elif [[ -n "$k1" ]]; then
+			psvar[15]="${kp}{$k1}"
+		else
+			psvar[15]="${kp}.$k2"
+		fi
+		# PDP_LABEL could be done with string interpolation into
+		# prompts at prompt display time; I forget why I was
+		# apprehensive about that, years ago.  Not going to require it now.
+		if [[ -n "${PDP_LABEL:-}" ]]; then
+			psvar[16]="$PDP_LABEL"
+			if [[ -n "${PDP_LABEL_COLOR:-}" ]] && ! (( ${+fg[$PDP_LABEL_COLOR]} )); then
+				print -u2 "unknown color \$PDP_LABEL_COLOR: ${(q-)PDP_LABEL_COLOR}"
+			fi
+		else
+			psvar[16]=''
+		fi
+		# As we add more here, update the indices shown when status_req is true
 	else
 		# We are stuck with 'v'
 		psvar[2]=$#jobstates; [[ $psvar[2] -eq 0 ]] && psvar[2]=''
@@ -368,18 +482,22 @@ function _pdp_prompt_pdp_precmd_awscreds_lookup {
 }
 
 function prompt_pdp_preexec_ssh {
+	# NB: changes in role are handled always, not just before running an ssh command
 	# todo: use not-=~ but something which works when =~ is not advanced?
 	if [[ $1 =~ '(?:(?:(?:(?:^.*/)|\b)ssh-add\b)|(?:^\s*🔑(?:\s.*)?$))' ]]; then
 		_prompt_pdp_ssh_redo=yes
-	elif (( EPOCHSECONDS - _prompt_pdp_cache_ssh_time > 900 )); then
+	elif (( EPOCHSECONDS - _prompt_pdp_cache_ssh_time[${SSH_PDP_ROLE:-default}] > 900 )); then
 		_prompt_pdp_ssh_redo=yes
 	elif [[ -z "${prompt_pdp_missing_zstat:-}" &&
-		-n "${_prompt_pdp_cachefile_ssh}" &&
-		-f "${_prompt_pdp_cachefile_ssh}" ]]; then
-		local st
-		zstat -H st "${_prompt_pdp_cachefile_ssh}" 2>/dev/null || return
-		if (( st[mtime] > _prompt_pdp_cache_ssh_time )); then
+		-n "${_prompt_pdp_cachefile_ssh[${SSH_PDP_ROLE:-default}]}" ]]; then
+		if [[ ! -f "${_prompt_pdp_cachefile_ssh[${SSH_PDP_ROLE:-default}]}" ]]; then
 			_prompt_pdp_ssh_redo=yes
+		else
+			local st
+			zstat -H st "${_prompt_pdp_cachefile_ssh[${SSH_PDP_ROLE:-default}]}" 2>/dev/null || return
+			if (( st[mtime] > _prompt_pdp_cache_ssh_time[${SSH_PDP_ROLE:-default}] )); then
+				_prompt_pdp_ssh_redo=yes
+			fi
 		fi
 	fi
 }
@@ -394,11 +512,19 @@ function prompt_pdp_hook_update_pyenv { _prompt_pdp_pyenv='!' }
 # Unusually, we always register the precmd, and then say "if unset then skip".
 # This is so that I can use direnv to export it and trigger auto-enable.
 function prompt_pdp_precmd_pyenv {
-	[[ -n "$_prompt_pdp_pyenv" ]] || return 0
-	if [[ ${(t)_prompt_pdp_pyenv} == *'export'* ]]; then
-		unset _prompt_pdp_pyenv
-		prompt pdp +pyenv
-		_prompt_pdp_pyenv='!'
+	# If the env-var is set, it takes precedence, we don't need to cache
+	# because we have it available.
+	if [[ -n "${PYENV_VERSION:-}" ]]; then
+		if [[ ${(t)PYENV_VERSION} == *'export'* ]]; then
+			psvar[13]="$PYENV_VERSION"
+		else
+			psvar[13]="[UNEXPORTED:$PYENV_VERSION]"
+		fi
+		return 0
+	fi
+	if [[ -z "$_prompt_pdp_pyenv" ]]; then
+		psvar[13]=''
+		return 0
 	fi
 	[[ "$_prompt_pdp_pyenv" != '!' ]] || _prompt_pdp_pyenv="$(pyenv version-name)"
 	psvar[13]="$_prompt_pdp_pyenv"
@@ -417,6 +543,19 @@ fi
 function prompt_pdp__emit_iterm_state {
 	print -nP '\e]1337;RemoteHost=%n@%M\a\e]1337;CurrentDir=%~\a'
 	# iTerm would have us let users hook in per-prompt vars here too; deferring implementation
+}
+
+# Restore window title status after commands "likely" to have messed with the title.
+# We'll accept false positives.
+prompt_pdp_cache_preexec_hook() {
+	case "$2" in
+	(*sudo* | *bash* | *zsh* | *ssh*) _pdp__trigger_chpwd='t' ;;
+	esac
+}
+prompt_pdp_postothershell_hook() {
+	[[ -n "$_pdp__trigger_chpwd" ]] || return 0
+	unset _pdp__trigger_chpwd
+	chpwd_pdp_prompt
 }
 
 function prompt_pdp_setup__disable_colour {
@@ -473,6 +612,9 @@ function prompt_pdp_setup__colour {
 	fg[%awscreds_none]="$fg[grey]"
 	fg[%awscreds_old]="$fg[red]"
 	fg[%pyenv]=$'\e[38;2;75;139;190m'  # #4B8BBE <https://www.schemecolor.com/python-logo-colors.php>
+	fg[%awsprofile]=$'\e[38;2;255;153;0m' # #FF9900 <https://usbrandcolors.com/amazon-colors/>
+	fg[%kube]=$'\e[38;2;50;108;229m'  # #326CE5 <https://github.com/kubernetes/kubernetes/blame/master/logo/logo.svg> path/style/fill
+	fg[%default_label]="$fg[red]$bold_color"
 	fg[%divider]=$'\e[38;5;238m'
 	return 1
 }
@@ -508,6 +650,7 @@ function prompt_pdp_setup {
 
 	local status_req=0
 	rhs_sections=()
+	if [[ $# -ge 1 && $1 == help ]]; then argv[1]='-help'; fi  # compat with below
 	# this one should work with any re; it's the aux functions which require better
 	while [[ $1 =~ ^([+-])(.+)$ ]] ; do
 		optname="$match[2]"
@@ -525,11 +668,25 @@ function prompt_pdp_setup {
 				zstyle -d "${(Q)s}"
 			done
 		fi ;;
+		(clear-cache|cache-clear|reset-cache|cache-reset|wipe-cache|cache-wipe)
+		  if (( onoffint )); then
+			[[ -z "${_prompt_pdp_cachefile_ssh[${SSH_PDP_ROLE:-default}]:-}" ]] || rm -- "$_prompt_pdp_cachefile_ssh[${SSH_PDP_ROLE:-default}]" || true
+			kerb_remaining_time wipe-cache
+			# gpg uncached
+			prompt_pdp_precmd_pyenv
+			if (( _prompt_pdp_awscreds )); then
+				unset _pdp_prev_prompt_aws_ts
+				prompt_pdp_precmd_awscreds
+			fi
+		  fi ;;
 		(ssh)				zstyle "$style_ctx" show-sshkeys $onoff ;;
 		(gpg|gnupg)			zstyle "$style_ctx" show-gpgagent $onoff ;;
 		(kerb|krb|kerberos|gssapi)	zstyle "$style_ctx" show-kerberos $onoff ;;
 		(awscreds)			zstyle "$style_ctx" show-awscreds $onoff ;;
+		(awsprofile)			zstyle "$style_ctx" show-awsprofile $onoff ;;
 		(pyenv)				zstyle "$style_ctx" show-pyenv $onoff ;;
+		(kube)				zstyle "$style_ctx" show-kube $onoff ;;
+		(label)				zstyle "$style_ctx" show-label $onoff ;;
 		(login|user|username)		zstyle "$style_ctx" show-login $onoff ;;
 		(machine|host|hostname)		zstyle "$style_ctx" show-host $onoff ;;
 		(tty|line)			zstyle "$style_ctx" show-tty $onoff ;;
@@ -565,9 +722,25 @@ function prompt_pdp_setup {
 		(status) # special, always just lists
 			status_req=1
 			;;
+		(h|help|-help)
+			cat >&2 <<-EOHELP
+			Usage: prompt pdp [+features-on ...] [-features-off]
+			Use: "prompt -h pdp" to see top-level verbose help.
+			Features:
+			  reset resetall status clear-cache
+			  color|colour mono
+			  ssh gpg|gnupg kerb|krb|kerberos|gssapi
+			  awscreds awsprofile pyenv kube label
+			  login|user|username machine|host|hostname tty|line time
+			  hist|histnum|histno job|jobs domain iterm
+			EOHELP
+			;;
 		(*) print -u2 "prompt:pdp: unknown option ${(q)optname} to turn $onoff" ;;
 		esac
 	done
+	if [[ $# -ge 1 ]]; then
+		print -u2 "prompt:pdp: unparsed args: ${(q-)@}"
+	fi
 
 # foo.local stet; foo.example.tld => foo; foo.bar.example.tld => foo.bar
 # foo.bar.example.co.cc => foo.bar; BUT foo.example.co.cc => foo.example
@@ -619,13 +792,19 @@ function prompt_pdp_setup {
 	_prompt_pdp_ssh=0
 	_prompt_pdp_gpg=0
 	_prompt_pdp_awscreds=0
+	_prompt_pdp_awsprofile=0
 	_prompt_pdp_pyenv=0
 	_prompt_pdp_emit_iterm=0
+	local show_kube=0  show_label=0 # only shell vars, no command triggering
 	zstyle -t "$style_ctx" show-kerberos && _prompt_pdp_krt=1
 	zstyle -t "$style_ctx" show-sshkeys && _prompt_pdp_ssh=1
 	zstyle -t "$style_ctx" show-gpgagent && _prompt_pdp_gpg=1
 	zstyle -t "$style_ctx" show-awscreds && _prompt_pdp_awscreds=1
+	zstyle -t "$style_ctx" show-awsprofile && _prompt_pdp_awsprofile=1
 	zstyle -t "$style_ctx" show-pyenv && _prompt_pdp_pyenv=1
+	#
+	zstyle -T "$style_ctx" show-kube && show_kube=1
+	zstyle -T "$style_ctx" show-label && show_label=1
 	zstyle -T "$style_ctx" emit-iterm && _prompt_pdp_emit_iterm=1
 	# these are only used for selecting sections to show
 	local -h show_login=0 show_tty=0 show_host=0 show_time=0 show_histnum=0 show_jobs=0
@@ -733,9 +912,20 @@ function prompt_pdp_setup {
 			_prompt_pdp_awscreds=0
 		fi
 	fi
-	# We always register the precmd hook, so that it can auto-enable pyenv
-	# display via export, for direnv integration.
-	add-zsh-hook precmd prompt_pdp_precmd_pyenv
+
+	if (( show_label )); then
+		# We want: rhs_sections+=( "%{%17v%}%16v$rs" )
+		# but %v forcibly escapes non-printing characters
+		# Not seeing how to handle this short of enabling prompt_subst
+		# For now, just note that `prompt pdp` will need to be called again
+		rhs_sections+=( "%{${PDP_LABEL_COLOR_RAW:-$fg[${PDP_LABEL_COLOR:-%default_label}]}%}%16v$rs" )
+	fi
+	if (( show_kube )); then
+		rhs_sections+=( "%{$fg[%kube]%}%15v$rs" )
+	fi
+	if (( _prompt_pdp_awsprofile )); then
+		rhs_sections+=( "%{$fg[%awsprofile]%}%14v$rs" )
+	fi
 	if (( _prompt_pdp_pyenv )); then
 		# reserve 13v
 		rhs_sections+=( "%{$fg[%pyenv]%}%13v$rs" )
@@ -750,13 +940,16 @@ function prompt_pdp_setup {
 	local idsep="%{$fg[%divider]%}⋮$rs"
 	eval identities_section="\${(j,${idsep},)identities}"
 
-	local cp
-	zstyle -s "$style_ctx" cache-path cp
-	if [[ -n "${cp}" ]]; then
+	# This is deliberately setting a global
+	zstyle -s "$style_ctx" cache-path _prompt_pdp_cache_dir
+
+	if [[ -n "$_prompt_pdp_cache_dir" ]]; then
 		# deliberately not local vars set here; as many as needed for different features
-		(( _prompt_pdp_ssh )) && _prompt_pdp_cachefile_ssh="$cp/prompt.pdp.ssh"
+		if (( _prompt_pdp_ssh )); then
+			_prompt_pdp_cachefile_ssh[${SSH_PDP_ROLE:-default}]="$_prompt_pdp_cache_dir/prompt.pdp.ssh${SSH_PDP_ROLE:+.}${SSH_PDP_ROLE:-}"
+			_prompt_pdp_cache_latest_role="${SSH_PDP_ROLE:-default}"
+		fi
 	fi
-	unset cp
 
 	local jobflag
 	if is-at-least 4.3.7; then jobflag=V ; else jobflag=v ; fi
@@ -773,7 +966,7 @@ function prompt_pdp_setup {
 		for p in "${(@o)parameters[(I)_prompt_pdp_*]}" ; do
 			print "$p: ${(P)p}"
 		done
-		for p in {1..13}; do
+		for p in {1..16}; do
 			print "$p: ${(V)psvar[p]}"
 		done
 		return 0
@@ -817,8 +1010,17 @@ function prompt_pdp_setup {
 	fi
 	RPS2=""
 	psvar=()
-	function precmd { prompt_pdp_precmd }  # is it purely historical that I'm not using the hooks here?
-	function preexec { }
+	# NB: _main will WIPE psvar, so *must* be registered before others
+	add-zsh-hook precmd prompt_pdp_precmd_main
+	add-zsh-hook preexec prompt_pdp_cache_preexec_hook
+	add-zsh-hook precmd prompt_pdp_postothershell_hook
+	# We always register the precmd hook, so that it can auto-enable pyenv
+	# display via export, for direnv integration.
+	add-zsh-hook precmd prompt_pdp_precmd_pyenv
+
+	# I think these are just to reset state from other prompt functions
+	function precmd preexec { }
+
 	if (( _prompt_pdp_emit_iterm )); then
 		prompt_pdp__emit_iterm_state
 		# if this version number is too low, butterbars appear warning that out-of-date
@@ -828,6 +1030,8 @@ function prompt_pdp_setup {
 	if is-at-least 5.4; then
 		# This is supposed to be for when prompts are replaced, but AFAICT from code inspection is currently only used when previewing?
 		# Should check more before opening my mouth on ML.
+		# The -D pattern-matches, so as long as I use prompt_pdp_ as a prefix for _all_ prompt-connected hooks,
+		# this should catch them.
 		prompt_cleanup '(){ local x; for x in preexec chpwd precmd; do add-zsh-hook -D "$x" "prompt_pdp_*"; done }'
 	fi
 }

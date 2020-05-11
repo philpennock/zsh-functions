@@ -1,0 +1,33 @@
+#compdef -value-,KUBE_NAMESPACE,-default-
+
+local expl
+local -a k8ns kcmd kcwords
+local extxt='Kubernetes namespaces'
+
+kcmd=(command kubectl)
+
+# FIXME: given 'KUBE_CONTEXT=foobar KUBE_NAMESPACE=<tab>' why is KUBE_CONTEXT
+# missing from $words ?  This stanza effectively does nothing as a result.
+#
+if [[ -z "${KUBE_CONTEXT:-}" && $#words -ge 1 ]]; then
+  # Don't use CURRENT to limit to words to the left, let something done to the
+  # right also impact us.
+  kcwords=( "${(@M)words:#KUBE_CONTEXT=*}" )
+  if [[ $#kcwords -ge 1 ]]; then
+    local KUBE_CONTEXT="${${kcwords[$#kcwords]}#KUBE_CONTEXT=}"
+  fi
+fi
+
+if [[ -n "${KUBE_CONTEXT:-}" ]]; then
+  kcmd+=(--context "$KUBE_CONTEXT")
+  extxt+=" for ctx ${(q-)KUBE_CONTEXT}"
+fi
+
+# I'm assuming that there's a reason that the `-o name` form includes a
+# `namespace/` prefix in front of the names, even though it's not accepted as a
+# namespace with that prefix, so we add a step to skip any entries which lack
+# that prefix.
+k8ns=(${${(M)${(f)"$("${kcmd[@]}" get namespaces -o name)"}:#namespace/*}#namespace/})
+
+_wanted kube-namespaces expl "$extxt" \
+  compadd "$@" -a k8ns

@@ -1,0 +1,6 @@
+#compdef -value-,NODENV_VERSION,-default-
+
+local expl
+
+_wanted nodenv-versions expl 'Node.js version through nodenv' \
+  compadd "$@" -- ~/.nodenv/versions/*(-/:t)

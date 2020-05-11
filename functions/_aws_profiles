@@ -3,13 +3,13 @@
 local expl
 
 local -a aws_from_config aws_from_credentials
-local fn full target pre post
+local fn envvar full target pre post
 
-for fn target pre post in \
-	config      aws_from_config      '[profile '  ']'  \
-	credentials aws_from_credentials '['          ']'  \
+for fn envvar target pre post in \
+	config      AWS_CONFIG_FILE             aws_from_config      '[profile '  ']'  \
+	credentials AWS_SHARED_CREDENTIALS_FILE aws_from_credentials '['          ']'  \
 ; do
-	full="${AWS_CONFIG_FILE:-$HOME/.aws/$fn}"
+	full="${(P)envvar:-$HOME/.aws/$fn}"
 	[[ -r "$full" ]] || continue
 	set -A "$target" ${${${(Mo)${(f)"$(<"$full")"}##${pre}*${post}}#${pre}}%${post}}
 done

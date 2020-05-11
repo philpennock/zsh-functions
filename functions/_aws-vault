@@ -1,0 +1,87 @@
+#compdef aws-vault
+
+local curcontext="$curcontext" state state_descr line subcmd
+local -a aws_vault_commands aws_vault_top_flags aws_vault_backends aws_vault_prompts
+
+aws_vault_commands=( $(${words[1]} --completion-bash ${words[1]}) )
+aws_vault_top_flags=( $(${words[1]} --completion-bash ${words[1]} --) )
+aws_vault_backends=( $(${words[1]} --completion-bash ${words[1]} --backend) )
+aws_vault_prompts=( $(${words[1]} --completion-bash ${words[1]} --prompt) )
+
+aws_vault_top_flags[(I)--backend]=("--backend:AWS-vault backend:($aws_vault_backends)")
+aws_vault_top_flags[(I)--prompt]=("--prompt:Prompt driver to use:($aws_vault_prompts)")
+aws_vault_top_flags[(I)--keychain]=('--keychain:Name of macOS keychain to use: ')
+aws_vault_top_flags[(I)--pass-dir]=('--pass-dir:Pass password store directory: ')
+aws_vault_top_flags[(I)--pass-cmd]=('--pass-cmd:Name of the pass executable: ')
+aws_vault_top_flags[(I)--pass-prefix]=('--pass-prefix:Prefix to prepend to the item path stored in pass: ')
+
+aws_vault_commands[(I)add]=("add:add credentials, prompting if necessary")
+aws_vault_commands[(I)exec]=("exec:run a command under this profile")
+aws_vault_commands[(I)list]=("list:list profiles, with credentials & sessions")
+aws_vault_commands[(I)login]=("login:generate a login link for the AWS console")
+aws_vault_commands[(I)remove]=("remove:remove credentials (or sessions)")
+aws_vault_commands[(I)rotate]=("rotate:rotate credentials")
+
+_arguments -C \
+  "${aws_vault_top_flags[@]}" \
+  '(-): :->commands' \
+  '(-)*:: :->after-command' && return
+
+# note that aws-vault lets the flags appear anywhere, only accumulating more
+# options based on the non-options seen.  It's a nightmare after exec, when I
+# need to remember to explicitly add `--`.
+# We're only completing in sane positions.
+
+case "$state" in
+(commands)
+  _describe -t aws-vault-commands 'aws-vault commands' aws_vault_commands
+  return
+  ;;
+(after-command)
+  curcontext=${curcontext%:*}-$line[1]:
+  case $line[1] in
+    (add)
+      _arguments -C \
+        '--env[read credentials from environment]' \
+        '--add-config[add a profile to the config file if not already there]' \
+        '1:profile name: '
+      ;;
+    (exec)
+      _arguments -s -S -C \
+        '(-d --duration)'{-d,--duration=}'[duration of temporary or assume-role session]:duration' \
+        '(-n --no-session)'{-n,--no-session}'[use master credentials, no STS session]' \
+        '(-t --mfa-token)'{-t,--mfa-token=}'[the MFA token to use]: ' \
+        '(-j --json)'{-j,--json}'[be an AWS credential helper]' \
+        '(-s --server)'{-s,--server}'[run server in background for credentials]' \
+        ':profile name:_aws_profiles'
+      # really, after --, we want to switch to _normal processing
+      ;;
+    (list)
+      _arguments -C \
+        '--profiles[show only profile names]' \
+        '--sessions[show only session names]' \
+        '--credentials[show only profiles with a stored credential]'
+      ;;
+    (login)
+      _arguments -C \
+        '(-d --duration)'{-d,--duration=}'[duration of temporary or assume-role session]:duration' \
+        '(-t --mfa-token)'{-t,--mfa-token=}'[the MFA token to use]: ' \
+        '--path=[the AWS service to access]: ' \
+        {-s,--stdout}'[print login URL to stdout instead of opening browser]' \
+        '1:profile name:_aws_profiles'
+      ;;
+    (remove)
+      _arguments -C \
+        '(-s --sessions-only)'{-s,--sessions-only}'[only remove sessions, leave credentials intact]' \
+        '1:profile name:_aws_profiles'
+      ;;
+    (rotate)
+      _arguments -C \
+        '(-n --no-session)'{-n,--no-session}'[use master credentials, no STS session]' \
+        '1:profile name:_aws_profiles'
+      ;;
+  esac
+  ;;
+esac
+
+# vim: set sw=2 et :

@@ -1,0 +1,9 @@
+#compdef -value-,KUBE_CONTEXT,-default-
+
+local expl
+local -a k8ctxs
+
+k8ctxs=("${(f)$(command kubectl config get-contexts -o name)}")
+
+_wanted kube-contexts expl 'Kubernetes context' \
+  compadd "$@" -a k8ctxs

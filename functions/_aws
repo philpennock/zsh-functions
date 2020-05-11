@@ -1,0 +1,20 @@
+#compdef aws
+
+local -a aws_offers
+local bash_comp_point=$(( 1 + ${#${(j. .)words[1,CURRENT-1]}} + $#QIPREFIX + $#IPREFIX + $#PREFIX ))
+# That gets us COMP_POINT, while COMP_LINE is the same as "$words"
+
+aws_offers=( ${(f)"$(
+	python3 -c '
+import sys
+try:
+  import awscli.completer as c
+except ImportError:
+  print("aws-completion: no awscli in your python path", file=sys.stderr)
+  sys.exit(1)
+c.complete(sys.argv[1], int(sys.argv[2]))' \
+	"$words" $bash_comp_point
+	)"} )
+# at this point, there are extra spaces after each word
+
+compadd -- ${aws_offers%% *}

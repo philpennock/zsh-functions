@@ -1,0 +1,6 @@
+#compdef -value-,RBENV_VERSION,-default-
+
+local expl
+
+_wanted rbenv-versions expl 'Ruby version through rbenv' \
+  compadd "$@" -- ~/.rbenv/versions/*(-/:t)
