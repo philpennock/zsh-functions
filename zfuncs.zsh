@@ -29,7 +29,7 @@ if have_cmd kubectl; then
     eval "function k-$I {
       local n tag;
       case \$1 in (:*) tag=\"\${1#:}\"; shift;; (*) tag=latest;; esac;
-      n=\"$I-\$tag-\$RANDOM\";
+      n=\"$I-\${tag//./-}-\$RANDOM\";
       echo >&2 \"pod: \$n\";
       k run -it --rm --restart=Never --image=\"$I:\$tag\" \$n -- \"\$@\"
     }"
