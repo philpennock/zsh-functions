@@ -117,3 +117,10 @@ Set up autoload for these and most of them will help with tab-completion.
 I also use some items in `zfuncs.zsh` which are not auto-loaded but are
 directly in-line, typically to avoid defining them unless some command is
 installed.
+
+## See Also
+
+I use <https://github.com/nnao45/zsh-kubectl-completion> for completing
+`kubectl`.  This is compatible with compdef aliasing so that I can have `k`
+tab-complete too (either add `k=kubectl` to the `#compdef` line at the start
+of the file, or run `compdef _kubectl k=kubectl` after loading).
