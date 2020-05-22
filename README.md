@@ -97,6 +97,7 @@ Set up autoload for these and most of them will help with tab-completion.
 * `_aws` — wrapper around bash completion, this one actually works
 * `_aws_profiles` — let `AWS_PROFILE=` tab-complete usefully
 * `_aws-vault` — completion for `aws-vault`
+* `_docker_contexts` — let `DOCKER_CONTEXT=` tab-complete usefully
 * `_pyenv_versions` — let `PYENV_VERSION=` tab-complete usefully
 * `_ssh-kube-gcloud` — completion for `bin/ssh-kube-gcloud` which is a wrapper
   around `gcloud compute ssh`; gcloud's tab-completion hits a remote end-point
@@ -104,7 +105,7 @@ Set up autoload for these and most of them will help with tab-completion.
   making it occasionally slow but usually fast.
 * `_vagrant` — decent fast tab-completion for Vagrant
 * `_kube_contexts` & `_kube_namespaces` — completion for
-  `$KUBE_CONTEXT` & `$KUBE_NAMESPACE`
+  `KUBE_CONTEXT=` & `KUBE_NAMESPACE=`
 * `_nodenv_versions`, `_pyenv_versions`, `_rbenv_versions` — completion for
   shell variables for controlling the respective interpreter dispatchers.
 * `prompt_pdp_setup` — invoked by zsh's prompt framework when told to use the

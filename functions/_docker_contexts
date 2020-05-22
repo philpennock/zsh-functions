@@ -1,0 +1,9 @@
+#compdef -value-,DOCKER_CONTEXT,-default-
+
+local expl
+local -a dctxs
+
+dctxs=("${(f)$(command docker context ls -q)}")
+
+_wanted docker-contexts expl 'Docker context' \
+  compadd "$@" -a dctxs
